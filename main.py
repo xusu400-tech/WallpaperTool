@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QAction, QInputDialog, QCheckBox, QDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap
+from PyQt5.QtGui import QPixmap, QIcon
 
 from wallpaper_engine import (
     get_screen_resolution, download_image, set_wallpaper,
@@ -25,6 +25,9 @@ from wallpaper_engine import (
 )
 from database import HistoryDB, THUMB_DIR
 from api_client import SOURCE_REGISTRY, get_source
+
+APP_DIR = Path(__file__).parent
+ICON_PATH = APP_DIR / "image" / "app_icon.jpg"
 
 # config.py 提供应用内代理设置；万一本地缺这个文件，降级运行而不是崩溃
 try:
@@ -359,6 +362,8 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("桌面壁纸助手")
         self.setGeometry(100, 100, 1100, 700)
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
@@ -948,8 +953,11 @@ class MainWindow(QMainWindow):
     
 # ================= 程序入口 =================
 if __name__ == "__main__":
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("WallpaperTool.Main")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
