@@ -2,6 +2,7 @@
 import sys
 import os
 import re
+import ctypes
 from pathlib import Path
 
 # socks5 代理支持（requests 动态导入，显式引用以便 PyInstaller 打包时收录）
@@ -342,6 +343,7 @@ class MainWindow(QMainWindow):
         self.db = HistoryDB()
         self.resolution = get_screen_resolution()
         self.current_results = []
+        self._seen_ids = set()
 
         # 默认图源：Bing 每日（国内直连可用，无需代理）
         self.current_source_name = "bing"
@@ -755,6 +757,7 @@ class MainWindow(QMainWindow):
         self.current_search_params = params
         self.current_page = 1
         self.has_more = True
+        self._seen_ids.clear()
 
         self._clear_results_grid()
 
@@ -773,8 +776,11 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.is_loading = False
         self.has_more = has_more
-        self.current_results.extend(results)
-        self._append_cards(results)
+        unique = [r for r in results if r["id"] not in self._seen_ids]
+        for r in unique:
+            self._seen_ids.add(r["id"])
+        self.current_results.extend(unique)
+        self._append_cards(unique)
 
     def on_search_error(self, msg):
         self.progress.setVisible(False)
