@@ -57,6 +57,27 @@ class HistoryDB:
     def add_record(self, file_name, file_path, source_url="",
                    tags="", resolution="", style="fill",
                    source="wallhaven", thumb_path=""):
+        # 同一图片只保留最新记录：先删旧记录 + 旧缓存文件
+        old = None
+        if source_url:
+            cur = self.conn.execute(
+                "SELECT file_path FROM history WHERE source_url=?",
+                (source_url,))
+            old = cur.fetchone()
+        if not old:
+            cur = self.conn.execute(
+                "SELECT file_path FROM history WHERE file_name=?",
+                (file_name,))
+            old = cur.fetchone()
+        if old and old[0] and old[0] != file_path:
+            from pathlib import Path
+            try:
+                Path(old[0]).unlink(missing_ok=True)
+            except Exception:
+                pass
+        self.conn.execute(
+            "DELETE FROM history WHERE source_url=? OR file_name=?",
+            (source_url, file_name))
         self.conn.execute(
             """INSERT INTO history (timestamp, file_name, file_path, source_url,
                tags, resolution, style, source, thumb_path)

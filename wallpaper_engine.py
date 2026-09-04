@@ -38,16 +38,27 @@ def download_image(url: str, filename: str = None) -> Path:
         filename = url.split("/")[-1].split("?")[0]
         if not filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
             filename += ".jpg"
-    
+
     save_path = CACHE_DIR / filename
     try:
         from config import get_proxies   # 延迟导入，避免循环依赖
     except ImportError:                  # 缺少 config.py 时降级为直连
         def get_proxies():
             return None
-    resp = requests.get(url, stream=True, timeout=30, proxies=get_proxies())
-    resp.raise_for_status()
-    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, stream=True, timeout=30,
+                                proxies=get_proxies(), headers=headers)
+            resp.raise_for_status()
+            break
+        except requests.exceptions.SSLError:
+            if attempt == 2:
+                raise
+        except requests.exceptions.RequestException:
+            if attempt == 2:
+                raise
+
     with open(save_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
