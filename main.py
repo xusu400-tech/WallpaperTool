@@ -71,11 +71,30 @@ CATEGORY_MAP = {
     "bing": [
         {"key": "daily", "label": "每日一图", "params": {}},
     ],
+    "netbian": [
+        {"key": "fengjing", "label": "风景", "params": {"cat": "fengjing"}},
+        {"key": "meinv",    "label": "美女", "params": {"cat": "meinv"}},
+        {"key": "dongman",  "label": "动漫", "params": {"cat": "dongman"}},
+        {"key": "youxi",    "label": "游戏", "params": {"cat": "youxi"}},
+        {"key": "qiche",    "label": "汽车", "params": {"cat": "qiche"}},
+        {"key": "dongwu",   "label": "动物", "params": {"cat": "dongwu"}},
+        {"key": "juzhao",   "label": "剧照", "params": {"cat": "juzhao"}},
+        {"key": "weimei",   "label": "唯美", "params": {"cat": "weimei"}},
+        {"key": "keai",     "label": "可爱", "params": {"cat": "keai"}},
+        {"key": "huahui",   "label": "花卉", "params": {"cat": "huahui"}},
+        {"key": "renwu",    "label": "人物", "params": {"cat": "renwu"}},
+        {"key": "jianzhu",  "label": "建筑", "params": {"cat": "jianzhu"}},
+        {"key": "tiyu",     "label": "体育", "params": {"cat": "tiyu"}},
+        {"key": "jieri",    "label": "节日", "params": {"cat": "jieri"}},
+        {"key": "meishi",   "label": "美食", "params": {"cat": "meishi"}},
+        {"key": "rili",     "label": "日历", "params": {"cat": "rili"}},
+    ],
     "local": [],   # 本地源无分类
 }
 
-# Bing 国内可直连，作为默认图源（下拉框第一项 = 默认选中）
+# 彼岸图网国内直连且分类最丰富，作为默认图源（下拉框第一项 = 默认选中）
 SOURCE_LABELS = {
+    "netbian":   "彼岸图网",
     "bing":      "Bing 每日",
     "wallhaven": "Wallhaven",
     "unsplash":  "Unsplash",
@@ -345,8 +364,8 @@ class MainWindow(QMainWindow):
         self.current_results = []
         self._seen_ids = set()
 
-        # 默认图源：Bing 每日（国内直连可用，无需代理）
-        self.current_source_name = "bing"
+        # 默认图源：彼岸图网（国内直连、分类丰富、无需代理）
+        self.current_source_name = "netbian"
 
         # 本次会话中用户是否已确认过代理可用（确认过之后切图源不再拦截）
         self._proxy_ready = False
@@ -513,6 +532,7 @@ class MainWindow(QMainWindow):
             <li><b>Unsplash</b>：图片来自 Unsplash，遵循
                 <a href="https://unsplash.com/license">Unsplash License</a>，可免费商用</li>
             <li><b>Bing</b>：图片来自微软 Bing 每日壁纸，版权归微软及原作者所有</li>
+            <li><b>彼岸图网</b>：图片来自 netbian.com，仅供个人欣赏，请勿商用</li>
             <li><b>本地</b>：图片来自您本机文件夹，版权归原始作者所有</li>
             </ul>
             <p>请尊重原作者版权，勿将图片用于商业用途。</p>
@@ -650,6 +670,8 @@ class MainWindow(QMainWindow):
             self.search_input.setPlaceholderText("输入英文关键词，如 landscape / game ...")
         elif name == "bing":
             self.search_input.setPlaceholderText("Bing 每日一图自动更新，无需搜索")
+        elif name == "netbian":
+            self.search_input.setPlaceholderText("彼岸图网按分类浏览，选择上方分类即可")
         else:
             self.search_input.setPlaceholderText("请先选择本地壁纸文件夹")
         self._fill_category_bar()
@@ -685,8 +707,21 @@ class MainWindow(QMainWindow):
             QPushButton#categoryTab:hover:!checked { color: #ffa500; }
         """)
         QHBoxLayout(self.category_bar)
+        self.category_bar.layout().setContentsMargins(0, 0, 0, 0)
         self._fill_category_bar()
-        return self.category_bar
+        # 分类较多（彼岸图网 19 个）时支持横向滚动
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.category_bar)
+        scroll.setFixedHeight(46)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea{border:none; background:transparent;}"
+            "QScrollBar:horizontal{height:5px; background:#f0f0f0;}"
+            "QScrollBar::handle:horizontal{background:#ccc; border-radius:2px;}"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal{width:0;}")
+        return scroll
 
     def _fill_category_bar(self):
         """根据当前源重建分类按钮"""
@@ -800,7 +835,7 @@ class MainWindow(QMainWindow):
                 f"无法连接 {host}（连接超时），该站点可能无法直连。\n\n"
                 "解决办法：\n"
                 "1. 菜单【设置 → 代理设置...】填入本机代理地址后重试；\n"
-                "2. 或改用「Bing 每日」「本地图源」等可直连的图源。")
+                "2. 或改用「Bing 每日」「彼岸图网」「本地图源」等可直连的图源。")
         else:
             QMessageBox.critical(self, "搜索失败", msg)
 
@@ -809,7 +844,7 @@ class MainWindow(QMainWindow):
         hint = QLabel(
             f"⚠ 无法连接 {host}，该站点可能无法直连\n\n"
             "可在菜单【设置 → 代理设置...】配置代理后重新搜索，\n"
-            "或切换到「Bing 每日」「本地图源」。")
+            "或切换到「Bing 每日」「彼岸图网」「本地图源」。")
         hint.setAlignment(Qt.AlignCenter)
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888; font-size:14px; padding:40px;")

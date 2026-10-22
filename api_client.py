@@ -1,3 +1,5 @@
+import re
+
 import requests
 from pathlib import Path
 from PIL import Image
@@ -109,6 +111,44 @@ class BingSource:
         return results, page < 10
 
 
+# ================= 彼岸图网 =================
+class NetbianSource:
+    """彼岸图网 (netbian.com)，国内直连，按分类浏览（无关键词搜索接口）"""
+    name = "netbian"
+    BASE = "https://www.netbian.com"
+    HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    def search(self, params, page=1, atleast=None, **kw):
+        slug = params.get("cat") or "fengjing"
+        url = f"{self.BASE}/{slug}/" if page <= 1 else f"{self.BASE}/{slug}/index_{page}.htm"
+        resp = requests.get(url, timeout=15, headers=self.HEADERS)
+        resp.raise_for_status()
+        resp.encoding = "gbk"
+
+        results = []
+        for desk, attrs in re.findall(r'<a href="(/desk/\d+\.htm)"[^>]*>\s*<img([^>]+)>', resp.text):
+            src_m = re.search(r'src="([^"]+)"', attrs)
+            if not src_m:
+                continue
+            thumb = src_m.group(1)
+            # small111547Cqvkp1792552547.jpg -> 111547Cqvkp.jpg（实测为 1920x1080 原图）
+            orig = re.sub(r"small(\w+)\d{10}", r"\1", thumb)
+            title_m = re.search(r'alt="([^"]*)"', attrs)
+            title = title_m.group(1).strip() if title_m else ""
+            results.append({
+                "id": f"netbian_{desk.split('/desk/')[1].split('.')[0]}",
+                "url": orig,
+                "thumb": thumb,
+                "resolution": "高清",   # 公开直链实测均为 1920x1080
+                "purity": "sfw",
+                "colors": [],
+                "author": title[:20] if title else "彼岸图网",
+                "source": self.name,
+            })
+        has_more = bool(re.search(rf'/{slug}/index_{page + 1}\.htm', resp.text))
+        return results, has_more
+
+
 # ================= 本地文件夹 =================
 class LocalSource:
     name = "local"
@@ -153,6 +193,7 @@ SOURCE_REGISTRY = {
     "wallhaven": WallhavenSource(),
     "unsplash":  UnsplashSource(),
     "bing":      BingSource(),
+    "netbian":   NetbianSource(),
     "local":     LocalSource(),
 }
 
