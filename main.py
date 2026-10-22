@@ -27,7 +27,11 @@ from wallpaper_engine import (
 from database import HistoryDB, THUMB_DIR
 from api_client import SOURCE_REGISTRY, get_source
 
-APP_DIR = Path(__file__).parent
+# PyInstaller 打包后资源在 sys._MEIPASS 解包目录，源码运行时在脚本目录
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys._MEIPASS)
+else:
+    APP_DIR = Path(__file__).parent
 ICON_PATH = APP_DIR / "image" / "app_icon.jpg"
 
 # config.py 提供应用内代理设置；万一本地缺这个文件，降级运行而不是崩溃
