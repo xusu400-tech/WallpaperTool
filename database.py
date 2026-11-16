@@ -61,23 +61,30 @@ class HistoryDB:
         old = None
         if source_url:
             cur = self.conn.execute(
-                "SELECT file_path FROM history WHERE source_url=?",
-                (source_url,))
+                "SELECT file_path FROM history WHERE source_url=? OR file_name=? LIMIT 1",
+                (source_url, file_name))
             old = cur.fetchone()
-        if not old:
+        else:
+            # 没有来源链接（旧数据）时只按文件名去重，不能误删其他有链接的记录
             cur = self.conn.execute(
-                "SELECT file_path FROM history WHERE file_name=?",
+                "SELECT file_path FROM history WHERE file_name=? "
+                "AND (source_url IS NULL OR source_url='') LIMIT 1",
                 (file_name,))
             old = cur.fetchone()
         if old and old[0] and old[0] != file_path:
-            from pathlib import Path
             try:
                 Path(old[0]).unlink(missing_ok=True)
             except Exception:
                 pass
-        self.conn.execute(
-            "DELETE FROM history WHERE source_url=? OR file_name=?",
-            (source_url, file_name))
+        if source_url:
+            self.conn.execute(
+                "DELETE FROM history WHERE source_url=? OR file_name=?",
+                (source_url, file_name))
+        else:
+            self.conn.execute(
+                "DELETE FROM history WHERE file_name=? "
+                "AND (source_url IS NULL OR source_url='')",
+                (file_name,))
         self.conn.execute(
             """INSERT INTO history (timestamp, file_name, file_path, source_url,
                tags, resolution, style, source, thumb_path)
@@ -102,6 +109,12 @@ class HistoryDB:
     # ---------- 收藏 ----------
     def add_favorite(self, file_path, file_name, source_url="",
                      thumb_path="", resolution="", source="wallhaven"):
+        # 同一来源链接只收藏一次，避免重复卡片
+        if source_url:
+            cur = self.conn.execute(
+                "SELECT 1 FROM favorites WHERE source_url=?", (source_url,))
+            if cur.fetchone():
+                return False
         try:
             self.conn.execute(
                 """INSERT INTO favorites (file_path, file_name, source_url,
@@ -117,6 +130,8 @@ class HistoryDB:
 
     def remove_favorite(self, key):
         """按 file_path 或 source_url 取消收藏"""
+        if not key:
+            return
         self.conn.execute(
             "DELETE FROM favorites WHERE file_path=? OR source_url=?",
             (key, key))

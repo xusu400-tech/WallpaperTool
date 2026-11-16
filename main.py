@@ -3,6 +3,8 @@ import sys
 import os
 import re
 import ctypes
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 # socks5 代理支持（requests 动态导入，显式引用以便 PyInstaller 打包时收录）
@@ -15,14 +17,15 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QPushButton, QLineEdit, QComboBox, QLabel, QScrollArea,
     QProgressBar, QMessageBox, QTabWidget, QFrame, QButtonGroup,
-    QFileDialog, QAction, QInputDialog, QCheckBox, QDialog
+    QFileDialog, QAction, QInputDialog, QCheckBox, QDialog, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap, QIcon
+from PyQt5.QtGui import QPixmap, QIcon, QImage, QImageReader
 
 from wallpaper_engine import (
     get_screen_resolution, download_image, set_wallpaper,
-    delete_cached_image, clear_cache, generate_thumbnail
+    delete_cached_image, clear_cache, generate_thumbnail, fetch_image_bytes,
+    THUMB_CACHE_DIR, thumbnail_cache_path, save_thumbnail_bytes
 )
 from database import HistoryDB, THUMB_DIR
 from api_client import SOURCE_REGISTRY, get_source
@@ -36,7 +39,7 @@ ICON_PATH = APP_DIR / "image" / "app_icon.jpg"
 
 # config.py 提供应用内代理设置；万一本地缺这个文件，降级运行而不是崩溃
 try:
-    from config import get_proxy_url, set_proxy_url, get_proxies
+    from config import get_proxy_url, set_proxy_url
     CONFIG_AVAILABLE = True
 except ImportError:
     CONFIG_AVAILABLE = False
@@ -46,9 +49,6 @@ except ImportError:
 
     def set_proxy_url(url):
         pass
-
-    def get_proxies():
-        return None
 
 # ============ 每个图源对应的分类配置 ============
 CATEGORY_MAP = {
@@ -60,16 +60,6 @@ CATEGORY_MAP = {
         {"key": "scifi",     "label": "科幻",  "params": {"q": "sci-fi"}},
         {"key": "game",      "label": "游戏",  "params": {"q": "video game"}},
         {"key": "car",       "label": "汽车",  "params": {"q": "car"}},
-        {"key": "sports",    "label": "体育",  "params": {"q": "sports"}},
-    ],
-    "unsplash": [
-        {"key": "featured",  "label": "精选",  "params": {"q": "nature"}},
-        {"key": "landscape", "label": "风景",  "params": {"q": "landscape,mountain"}},
-        {"key": "anime",     "label": "动漫",  "params": {"q": "anime,illustration"}},
-        {"key": "beauty",    "label": "美女",  "params": {"q": "portrait,woman"}},
-        {"key": "scifi",     "label": "科幻",  "params": {"q": "sci-fi,futuristic"}},
-        {"key": "game",      "label": "游戏",  "params": {"q": "gaming,neon"}},
-        {"key": "car",       "label": "汽车",  "params": {"q": "car,supercar"}},
         {"key": "sports",    "label": "体育",  "params": {"q": "sports"}},
     ],
     "bing": [
@@ -93,40 +83,108 @@ CATEGORY_MAP = {
         {"key": "meishi",   "label": "美食", "params": {"cat": "meishi"}},
         {"key": "rili",     "label": "日历", "params": {"cat": "rili"}},
     ],
+    "zzzmh": [
+        {"key": "人物", "label": "人物", "params": {"cat": "人物"}},
+        {"key": "风景", "label": "风景", "params": {"cat": "风景"}},
+        {"key": "动物", "label": "动物", "params": {"cat": "动物"}},
+        {"key": "食物", "label": "食物", "params": {"cat": "食物"}},
+        {"key": "华丽", "label": "华丽", "params": {"cat": "华丽"}},
+        {"key": "厚涂", "label": "厚涂", "params": {"cat": "厚涂"}},
+        {"key": "浓彩", "label": "浓彩", "params": {"cat": "浓彩"}},
+        {"key": "水彩", "label": "水彩", "params": {"cat": "水彩"}},
+        {"key": "景观", "label": "景观", "params": {"cat": "景观"}},
+    ],
     "local": [],   # 本地源无分类
 }
 
-# 彼岸图网国内直连且分类最丰富，作为默认图源（下拉框第一项 = 默认选中）
+# 极简壁纸国内直连、免登录且支持关键词搜索，作为默认图源（下拉框第一项 = 默认选中）
 SOURCE_LABELS = {
+    "zzzmh":     "极简壁纸",
     "netbian":   "彼岸图网",
     "bing":      "Bing 每日",
     "wallhaven": "Wallhaven",
-    "unsplash":  "Unsplash",
     "local":     "本地文件夹",
 }
 
 # 这些图源国内无法直连：切换过去时不自动加载，先给出代理提示 + 开关
-PROXY_REQUIRED_SOURCES = {"wallhaven", "unsplash"}
+PROXY_REQUIRED_SOURCES = {"wallhaven"}
 
 
 # ================= 线程组件 =================
+# 缩略图并发上限：一页可能有几十张图，全部同时下载会互相抢占带宽、拖慢首屏
+_THUMB_SEMAPHORE = threading.Semaphore(4)
+
+# 未命中内存缓存时才解码/下载；只保留最近用过的若干张（QImage 本身很小）
+_THUMB_MEM = OrderedDict()
+_THUMB_MEM_MAX = 120
+
+
+def thumb_mem_get(url):
+    image = _THUMB_MEM.get(url)
+    if image is not None:
+        _THUMB_MEM.move_to_end(url)
+    return image
+
+
+def thumb_mem_put(url, image):
+    _THUMB_MEM[url] = image
+    _THUMB_MEM.move_to_end(url)
+    while len(_THUMB_MEM) > _THUMB_MEM_MAX:
+        _THUMB_MEM.popitem(last=False)
+
+
 class ThumbLoader(QThread):
-    """异步加载网络缩略图"""
-    loaded = pyqtSignal(QPixmap)
+    """异步加载缩略图（网络图先查磁盘缓存；本地图按显示尺寸解码，不读整张原图）
+
+    线程内只做下载 + QImage 解码（QPixmap 只能在 GUI 线程创建），
+    结果通过信号交回主线程转成 QPixmap。
+    """
+    loaded = pyqtSignal(QImage)
+    failed = pyqtSignal()
 
     def __init__(self, url):
         super().__init__()
         self.url = url
 
     def run(self):
-        import requests
         try:
-            resp = requests.get(self.url, timeout=10, proxies=get_proxies())
-            pixmap = QPixmap()
-            pixmap.loadFromData(resp.content)
-            self.loaded.emit(pixmap)
+            image = self._load()
+            if image is None or image.isNull():
+                self.failed.emit()
+            else:
+                self.loaded.emit(image)
         except Exception:
-            pass
+            self.failed.emit()
+
+    def _load(self):
+        if not self.url.startswith("http"):
+            return self._load_local()
+        cache = thumbnail_cache_path(self.url)
+        if cache.exists():
+            image = QImage(str(cache))
+            if not image.isNull():
+                return image
+            try:
+                cache.unlink()   # 缓存损坏则删除后重新下载
+            except OSError:
+                pass
+        # 限制同时下载的数量，其余请求自动排队
+        with _THUMB_SEMAPHORE:
+            data = fetch_image_bytes(self.url, timeout=10)
+        save_thumbnail_bytes(data, cache)   # 缩小后落盘，下次直接读缓存
+        image = QImage.fromData(data)
+        if image.isNull():
+            return image
+        return image.scaled(400, 280, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _load_local(self):
+        """本地图片用 QImageReader 按目标尺寸解码，避免把 4K 原图整张读入"""
+        reader = QImageReader(self.url)
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if size.isValid():
+            reader.setScaledSize(size.scaled(400, 280, Qt.KeepAspectRatio))
+        return reader.read()
 
 
 class SearchThread(QThread):
@@ -148,6 +206,51 @@ class SearchThread(QThread):
             self.finished.emit(results, has_more)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class FavoriteThread(QThread):
+    """后台下载收藏图片并生成缩略图，避免点击收藏时界面卡顿"""
+    done = pyqtSignal(str, str)      # 图片路径, 缩略图路径
+    failed = pyqtSignal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            if self.url.startswith("http"):
+                path = download_image(self.url)
+            else:
+                path = Path(self.url)
+            thumb = generate_thumbnail(str(path))
+            self.done.emit(str(path), str(thumb) if thumb else "")
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class ApplyThread(QThread):
+    """后台下载并设置壁纸：网络请求、注册表写入和系统调用都不在 GUI 线程执行"""
+    done = pyqtSignal(str, str)      # 图片路径, 缩略图路径
+    failed = pyqtSignal(str)
+
+    def __init__(self, info, style):
+        super().__init__()
+        self.info = info
+        self.style = style
+
+    def run(self):
+        try:
+            url = self.info["url"]
+            if url.startswith("http"):
+                path = download_image(url)
+            else:
+                path = Path(url)   # 本地源：直接用文件路径
+            set_wallpaper(str(path), style=self.style)
+            thumb = generate_thumbnail(str(path))
+            self.done.emit(str(path), str(thumb) if thumb else "")
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 # ================= 壁纸卡片（搜索结果） =================
@@ -189,12 +292,30 @@ class WallpaperCard(QFrame):
 
     def load_thumb(self):
         url = self.info.get("thumb") or self.info.get("url", "")
-        if url.startswith("http"):
-            self._thumb_thread = ThumbLoader(url)
-            self._thumb_thread.loaded.connect(self.set_pixmap)
-            self._thumb_thread.start()
-        else:
-            self.set_pixmap(QPixmap(url))
+        if not url:
+            self._on_thumb_failed()
+            return
+        image = thumb_mem_get(url)
+        if image is not None:
+            self.set_image(image)
+            return
+        self._thumb_key = url
+        self._thumb_thread = ThumbLoader(url)
+        self._thumb_thread.loaded.connect(self._on_image_loaded)
+        self._thumb_thread.failed.connect(self._on_thumb_failed)
+        self._thumb_thread.start()
+
+    def _on_image_loaded(self, image):
+        thumb_mem_put(self._thumb_key, image)
+        self.set_image(image)
+
+    def set_image(self, image):
+        self.set_pixmap(QPixmap.fromImage(image))
+
+    def _on_thumb_failed(self):
+        self.thumb_label.setText("图片加载失败")
+        self.thumb_label.setStyleSheet(
+            "background:#eee; color:#999; font-size:12px;")
 
     def set_pixmap(self, pixmap):
         if pixmap and not pixmap.isNull():
@@ -219,25 +340,42 @@ class WallpaperCard(QFrame):
         if self.is_fav:
             main.db.remove_favorite(info["url"])
             self._set_fav(False)
-        else:
-            try:
-                # 在线图源先下载到本地缓存，避免 URL 失效
-                if info["url"].startswith("http"):
-                    path = download_image(info["url"])
-                else:
-                    path = Path(info["url"])
-                thumb = generate_thumbnail(str(path))
-                main.db.add_favorite(
-                    file_path=str(path),
-                    file_name=path.name[:80],
-                    source_url=info["url"],
-                    thumb_path=str(thumb) if thumb else "",
-                    resolution=info["resolution"],
-                    source=info.get("source", "wallhaven")
-                )
-                self._set_fav(True)
-            except Exception as e:
-                QMessageBox.warning(self, "收藏失败", str(e))
+            main.refresh_favorites()   # 同步「我的喜欢」列表
+            return
+        if getattr(self, "_fav_thread", None) is not None and self._fav_thread.isRunning():
+            return
+        # 下载原图 + 生成缩略图都放到后台线程，按钮先置灰防重复点击
+        self.btn_fav.setEnabled(False)
+        self.btn_fav.setText("…")
+        self._fav_thread = FavoriteThread(info["url"])
+        self._fav_thread.done.connect(self._on_fav_done)
+        self._fav_thread.failed.connect(self._on_fav_failed)
+        self._fav_thread.start()
+
+    def _on_fav_done(self, path, thumb):
+        main = self.window()
+        info = self.info
+        self.btn_fav.setEnabled(True)
+        try:
+            main.db.add_favorite(
+                file_path=path,
+                file_name=os.path.basename(path)[:80],
+                source_url=info["url"],
+                thumb_path=thumb,
+                resolution=info["resolution"],
+                source=info.get("source", "wallhaven")
+            )
+            self._set_fav(True)
+            main.refresh_favorites()
+            main.statusBar().showMessage("已加入收藏", 2000)
+        except Exception as e:
+            self._set_fav(False)
+            QMessageBox.warning(self, "收藏失败", str(e))
+
+    def _on_fav_failed(self, msg):
+        self.btn_fav.setEnabled(True)
+        self._set_fav(False)
+        QMessageBox.warning(self, "收藏失败", msg)
 
     def on_apply(self):
         main = self.window()
@@ -300,16 +438,40 @@ class HistoryCard(QFrame):
         pixmap = QPixmap()
         if self.tpath and Path(self.tpath).exists():
             pixmap.load(self.tpath)
-        elif self.fpath and Path(self.fpath).exists():
-            t = generate_thumbnail(self.fpath)
-            if t:
-                pixmap.load(str(t))
-        elif self.surl and self.surl.startswith("http"):
-            self._thread = ThumbLoader(self.surl)
-            self._thread.loaded.connect(self._set_pixmap)
-            self._thread.start()
+        if not pixmap.isNull():
+            self._set_pixmap(pixmap)
             return
-        self._set_pixmap(pixmap)
+        # 缩略图缺失时：本地原图或网络图都放到后台线程按显示尺寸解码，
+        # 避免生成缩略图时在界面线程解码大图造成卡顿
+        key = ""
+        if self.fpath and Path(self.fpath).exists():
+            key = self.fpath
+        elif self.surl and self.surl.startswith("http"):
+            key = self.surl
+        if not key:
+            self._on_thumb_failed()
+            return
+        image = thumb_mem_get(key)
+        if image is not None:
+            self._set_image(image)
+            return
+        self._thumb_key = key
+        self._thread = ThumbLoader(key)
+        self._thread.loaded.connect(self._on_image_loaded)
+        self._thread.failed.connect(self._on_thumb_failed)
+        self._thread.start()
+
+    def _on_image_loaded(self, image):
+        thumb_mem_put(self._thumb_key, image)
+        self._set_image(image)
+
+    def _set_image(self, image):
+        self._set_pixmap(QPixmap.fromImage(image))
+
+    def _on_thumb_failed(self):
+        self.thumb_label.setText("图片加载失败")
+        self.thumb_label.setStyleSheet(
+            "background:#222; border-radius:4px; color:#999; font-size:12px;")
 
     def _set_pixmap(self, pixmap):
         if not pixmap.isNull():
@@ -318,12 +480,21 @@ class HistoryCard(QFrame):
                 Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def on_apply(self):
-        if Path(self.fpath).exists():
-            style = self.style if self.style else "fill"
-            set_wallpaper(self.fpath, style=style)
-            QMessageBox.information(self, "成功", f"已切换到: {self.fname}")
+        main = self.window()
+        if self.fpath and Path(self.fpath).exists():
+            url = self.fpath
+        elif self.surl and self.surl.startswith("http"):
+            url = self.surl   # 缓存被清理过：用原始链接重新下载
         else:
-            QMessageBox.warning(self, "失败", "图片文件已不存在")
+            QMessageBox.warning(self, "失败", "图片文件已不存在，且没有可用的下载链接")
+            return
+        # 统一走主窗口的后台设置流程：不卡界面，带进度与失败提示
+        main.apply_wallpaper({
+            "url": url,
+            "resolution": self.res or "",
+            "source": self.source or "",
+            "tags": self.tags or "",
+        })
 
 
 # ================= 收藏卡片（复用历史卡片逻辑） =================
@@ -352,10 +523,11 @@ class FavoriteCard(HistoryCard):
         layout.addLayout(btn_row)
 
     def on_fav(self):
-        # 收藏页点 ❤️ = 取消收藏并从列表移除
+        # 收藏页点 ❤️ = 取消收藏并从列表移除（按主键删除，避免 source_url 为空时删不掉）
         main = self.window()
-        main.db.remove_favorite(self.surl)
+        main.db.delete_favorite_by_id(self.rid)
         main.refresh_favorites()
+        main._sync_fav_icons()
 
 
 
@@ -368,8 +540,9 @@ class MainWindow(QMainWindow):
         self.current_results = []
         self._seen_ids = set()
 
-        # 默认图源：彼岸图网（国内直连、分类丰富、无需代理）
-        self.current_source_name = "netbian"
+        # 默认图源：极简壁纸（国内直连、免登录、支持关键词搜索）
+        # 彼岸图网仍保留在下拉中，但它有 WAF 拦截风险，不作为启动默认源
+        self.current_source_name = "zzzmh"
 
         # 本次会话中用户是否已确认过代理可用（确认过之后切图源不再拦截）
         self._proxy_ready = False
@@ -428,7 +601,7 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.btn_search)
         search_layout.addLayout(search_row)
 
-        # 按默认图源（Bing）同步控件初始状态：禁用搜索框、填充分类栏
+        # 按默认图源同步控件初始状态：搜索框禁用/启用的判定、填充分类栏
         self._sync_source_controls(self.current_source_name)
 
         self.progress = QProgressBar()
@@ -533,10 +706,9 @@ class MainWindow(QMainWindow):
             <p><b>图片版权声明：</b></p>
             <ul align="left">
             <li><b>Wallhaven</b>：图片来自 wallhaven.cc，仅供个人欣赏，请勿商用</li>
-            <li><b>Unsplash</b>：图片来自 Unsplash，遵循
-                <a href="https://unsplash.com/license">Unsplash License</a>，可免费商用</li>
             <li><b>Bing</b>：图片来自微软 Bing 每日壁纸，版权归微软及原作者所有</li>
             <li><b>彼岸图网</b>：图片来自 netbian.com，仅供个人欣赏，请勿商用</li>
+            <li><b>极简壁纸</b>：图片来自 bz.zzzmh.cn，仅供个人欣赏，请勿商用</li>
             <li><b>本地</b>：图片来自您本机文件夹，版权归原始作者所有</li>
             </ul>
             <p>请尊重原作者版权，勿将图片用于商业用途。</p>
@@ -568,15 +740,20 @@ class MainWindow(QMainWindow):
             self.current_search_params = None
             self._clear_results_grid()
             return
-        # 需要代理的图源：尚未配置应用内代理、且本次会话没确认过代理时，
-        # 先弹指引（含官网链接）；勾选确认才加载，取消/关闭则自动切回原图源
-        if (name in PROXY_REQUIRED_SOURCES
-                and not get_proxy_url() and not self._proxy_ready):
+        # 需要代理的图源：未配置时先弹指引，勾选确认才加载，
+        # 取消/关闭则回退到原图源并明确提示原因（避免"选了没反应"）
+        need_proxy = (name in PROXY_REQUIRED_SOURCES
+                      and not get_proxy_url() and not self._proxy_ready)
+        if need_proxy:
             if self._show_proxy_gate(name):
                 self._proxy_ready = True
                 self.do_search()
             else:
                 self._revert_source(prev)
+                QMessageBox.information(
+                    self, "未切换图源",
+                    f"{SOURCE_LABELS[name]} 需要先开启代理，当前无法加载。\n"
+                    f"已继续使用「{SOURCE_LABELS.get(prev, prev)}」。")
             return
         self.do_search()
 
@@ -591,7 +768,7 @@ class MainWindow(QMainWindow):
         self._sync_source_controls(prev)
 
     def _show_proxy_gate(self, name):
-        """需要代理/Key 的图源：弹出配置指引，返回是否启用"""
+        """需要代理的图源：弹出配置指引，返回是否启用"""
         dialog = QDialog(self)
         dialog.setWindowTitle(f"启用 {SOURCE_LABELS[name]}")
         dialog.setMinimumWidth(520)
@@ -599,7 +776,7 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(dialog)
 
         tip = QLabel(
-            f"⚠ {SOURCE_LABELS[name]} 无法访问\n\n"
+            f"⚠ 启用 {SOURCE_LABELS[name]} 需要完成配置\n\n"
             + self._source_help_text(name))
         tip.setTextFormat(Qt.PlainText)
         tip.setWordWrap(True)
@@ -611,7 +788,7 @@ class MainWindow(QMainWindow):
 
         lay.addSpacing(8)
 
-        ck = QCheckBox("我已完成配置（已开代理 / 已填 Key），启用此图源")
+        ck = QCheckBox("我已完成配置（已开启代理），启用此图源")
         lay.addWidget(ck)
 
         btns = QHBoxLayout()
@@ -632,22 +809,13 @@ class MainWindow(QMainWindow):
 
     def _source_help_text(self, name):
         """不同图源给出不同的排障指引"""
-        if name == "unsplash":
-            return (
-                "1. Unsplash 需要配置自己的 API Key 才能使用：\n"
-                "   • 打开下方官网 → 注册账号 → Your apps → New Application\n"
-                "   • 勾选同意条款 → 填写应用名 → 创建后复制 Access Key 填入程序\n\n"
-                "2. Unsplash 在国内可能无法直连，如需访问请开启代理：\n"
-                "   • 开启代理软件（系统代理或 TUN/增强模式均可）\n"
-                "   • 或在菜单【设置 → 代理设置...】里填入代理地址\n\n"
-                "3. 完成配置后，勾选下面的开关并加载。"
-            )
-
-        elif name == "wallhaven":
+        if name == "wallhaven":
             return (
                 "1. Wallhaven 在国内无法直连，需要代理才能访问：\n"
-                "   • 开启代理软件（系统代理或 TUN/增强模式均可）\n"
-                "   • 或在菜单【设置 → 代理设置...】里填入代理地址\n\n"
+                "   • 开启代理软件的 TUN / 增强（全局）模式；或\n"
+                "   • 在菜单【设置 → 代理设置...】里填入代理地址\n"
+                "     （例如 http://127.0.0.1:7890）\n"
+                "   注意：仅开浏览器系统代理对本程序无效，必须用上面两种方式之一。\n\n"
                 "2. 然后勾选下面的开关并加载。"
             )
         else:   # bing / local 一般不需要额外配置
@@ -667,11 +835,13 @@ class MainWindow(QMainWindow):
     def _sync_source_controls(self, name):
         """根据当前图源同步控件状态（启动时和切换图源时都会调用）"""
         self.btn_pick_folder.setVisible(name == "local")
-        searchable = name in ("wallhaven", "unsplash")
+        searchable = name in ("wallhaven", "zzzmh")
         self.search_input.setEnabled(searchable)
         self.btn_search.setEnabled(searchable)
-        if searchable:
+        if name == "wallhaven":
             self.search_input.setPlaceholderText("输入英文关键词，如 landscape / game ...")
+        elif name == "zzzmh":
+            self.search_input.setPlaceholderText("输入中文关键词搜索，如 风景 / 猫 / 星空 ...")
         elif name == "bing":
             self.search_input.setPlaceholderText("Bing 每日一图自动更新，无需搜索")
         elif name == "netbian":
@@ -712,18 +882,21 @@ class MainWindow(QMainWindow):
         """)
         QHBoxLayout(self.category_bar)
         self.category_bar.layout().setContentsMargins(0, 0, 0, 0)
+        # 禁止压缩到 sizeHint 以下，保证按钮溢出时滚动条必然出现
+        self.category_bar.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         self._fill_category_bar()
-        # 分类较多（彼岸图网 19 个）时支持横向滚动
+        # 分类较多（彼岸图网 16 个）时支持横向滚动
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.category_bar)
-        scroll.setFixedHeight(46)
+        scroll.setFixedHeight(50)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet(
             "QScrollArea{border:none; background:transparent;}"
-            "QScrollBar:horizontal{height:5px; background:#f0f0f0;}"
-            "QScrollBar::handle:horizontal{background:#ccc; border-radius:2px;}"
+            "QScrollBar:horizontal{height:8px; background:#f0f0f0; border-radius:4px;}"
+            "QScrollBar::handle:horizontal{background:#aaa; border-radius:4px; min-width:30px;}"
+            "QScrollBar::handle:horizontal:hover{background:#888;}"
             "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal{width:0;}")
         return scroll
 
@@ -766,6 +939,8 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         self.category_buttons[0].setChecked(True)
         self.current_category = cats[0]
+        # 强制立即重算几何，确保外层 QScrollArea 及时更新滚动条状态
+        layout.activate()
 
     def on_category_clicked(self, category):
         """点击分类标签：回填搜索框 + 立即搜索"""
@@ -824,14 +999,22 @@ class MainWindow(QMainWindow):
     def on_search_error(self, msg):
         self.progress.setVisible(False)
         self.is_loading = False
+        # 启动自动加载失败时一律在结果区提示，绝不弹窗打断首屏
+        silent = getattr(self, "_error_silent", False)
+        if "人机验证" in msg or "HTTP 405" in msg:
+            # 彼岸图网 WAF 拦截：给出可操作的提示，不弹原始报错
+            if silent:
+                self._show_blocked_hint()
+            else:
+                QMessageBox.warning(self, "彼岸图网暂时不可用", msg)
+            return
         # 网络连不上时给出可操作的建议，而不是原始报错信息
         if "timed out" in msg or "Max retries" in msg or "ConnectionError" in msg:
             host = "图源网站"
             m = re.search(r"host='([^']+)'", msg)
             if m:
                 host = m.group(1)
-            if getattr(self, "_error_silent", False):
-                # 启动自动加载失败：不打断启动，仅在结果区显示提示
+            if silent:
                 self._show_net_hint(host)
                 return
             QMessageBox.critical(
@@ -839,16 +1022,40 @@ class MainWindow(QMainWindow):
                 f"无法连接 {host}（连接超时），该站点可能无法直连。\n\n"
                 "解决办法：\n"
                 "1. 菜单【设置 → 代理设置...】填入本机代理地址后重试；\n"
-                "2. 或改用「Bing 每日」「彼岸图网」「本地图源」等可直连的图源。")
+                "2. 或改用「极简壁纸」「Bing 每日」「彼岸图网」「本地图源」等可直连的图源。")
+        elif silent:
+            self._show_generic_hint(msg)
         else:
             QMessageBox.critical(self, "搜索失败", msg)
+
+    def _show_generic_hint(self, msg):
+        """启动自动加载遇到非网络错误时的结果区提示（不弹窗）"""
+        text = str(msg).strip()
+        if len(text) > 200:
+            text = text[:200] + "…"
+        hint = QLabel(f"⚠ 图片加载失败\n\n{text}\n\n可点击上方分类重试，或切换其他图源。")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888; font-size:14px; padding:40px;")
+        self.grid_layout.addWidget(hint, 0, 0, 1, 5)
+
+    def _show_blocked_hint(self):
+        """启动自动加载被 WAF 拦截时，在结果区显示提示（不打断启动）"""
+        hint = QLabel(
+            "⚠ 彼岸图网触发了人机验证（HTTP 405，站点侧限制）\n\n"
+            "可等待 1~5 分钟后点击分类重试，\n"
+            "或切换到「极简壁纸」「Bing 每日」等其他图源。")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888; font-size:14px; padding:40px;")
+        self.grid_layout.addWidget(hint, 0, 0, 1, 5)
 
     def _show_net_hint(self, host):
         """在搜索结果区显示网络提示（代替启动时的报错弹窗）"""
         hint = QLabel(
             f"⚠ 无法连接 {host}，该站点可能无法直连\n\n"
             "可在菜单【设置 → 代理设置...】配置代理后重新搜索，\n"
-            "或切换到「Bing 每日」「彼岸图网」「本地图源」。")
+            "或切换到「Bing 每日」等其他图源。")
         hint.setAlignment(Qt.AlignCenter)
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888; font-size:14px; padding:40px;")
@@ -887,29 +1094,50 @@ class MainWindow(QMainWindow):
 
     # ---------- 壁纸操作 ----------
     def apply_wallpaper(self, info):
+        """点击「设置」：下载与系统调用交给后台线程，界面保持可响应"""
+        thread = getattr(self, "_apply_thread", None)
+        if thread is not None and thread.isRunning():
+            return   # 上一次还在执行，忽略重复点击
+        self._apply_info = info
+        self._apply_style = self.style_combo.currentText().split(" ")[0]
+        # 搜索结果没有 tags 字段，沿用搜索框内容；历史/收藏卡片带回原标签
+        self._apply_tags = info.get("tags", self.search_input.text())
+
+        self.statusBar().showMessage(f"正在下载并设置壁纸（{info['resolution']}）...")
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+
+        self._apply_thread = ApplyThread(info, self._apply_style)
+        self._apply_thread.done.connect(self.on_apply_done)
+        self._apply_thread.failed.connect(self.on_apply_failed)
+        self._apply_thread.start()
+
+    def on_apply_done(self, path, thumb):
+        self.statusBar().clearMessage()
+        if not self.is_loading:
+            self.progress.setVisible(False)
+        info = self._apply_info
         try:
-            url = info["url"]
-            if url.startswith("http"):
-                path = download_image(url)
-            else:
-                path = url   # 本地源：直接用文件路径
-            style = self.style_combo.currentText().split(" ")[0]
-            set_wallpaper(path, style=style)
-            thumb = generate_thumbnail(str(path))
             self.db.add_record(
-                file_name=os.path.basename(str(path)),
-                file_path=str(path),
-                source_url=url,
-                tags=self.search_input.text(),
+                file_name=os.path.basename(path),
+                file_path=path,
+                source_url=info["url"],
+                tags=self._apply_tags,
                 resolution=info["resolution"],
-                style=style,
+                style=self._apply_style,
                 source=info.get("source", "wallhaven"),
-                thumb_path=str(thumb) if thumb else ""
+                thumb_path=thumb
             )
             self.refresh_history()
-            QMessageBox.information(self, "成功", f"壁纸已切换！\n{info['resolution']}")
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            QMessageBox.warning(self, "记录失败", str(e))
+        QMessageBox.information(self, "成功", f"壁纸已切换！\n{info['resolution']}")
+
+    def on_apply_failed(self, msg):
+        self.statusBar().clearMessage()
+        if not self.is_loading:
+            self.progress.setVisible(False)
+        QMessageBox.critical(self, "设置失败", msg)
 
     # ---------- 收藏 / 历史 ----------
     def refresh_favorites(self):
@@ -922,6 +1150,13 @@ class MainWindow(QMainWindow):
             card = FavoriteCard(f)
             row, col = divmod(i, 5)
             self.fav_grid.addWidget(card, row, col)
+
+    def _sync_fav_icons(self):
+        """收藏状态变化后同步搜索结果卡片上的爱心图标"""
+        for i in range(self.grid_layout.count()):
+            w = self.grid_layout.itemAt(i).widget()
+            if isinstance(w, WallpaperCard):
+                w._set_fav(self.db.is_favorite(w.info["url"]))
 
     def refresh_history(self):
         while self.hist_grid.count():
@@ -941,15 +1176,20 @@ class MainWindow(QMainWindow):
 
     def clear_all_cache(self):
         count = clear_cache()
-        for f in THUMB_DIR.glob("*"):
-            if f.is_file():
-                f.unlink()
-                count += 1
+        for folder in (THUMB_DIR, THUMB_CACHE_DIR):
+            for f in folder.glob("*"):
+                if f.is_file():
+                    f.unlink()
+                    count += 1
+        _THUMB_MEM.clear()
         self.refresh_history()
         self.refresh_favorites()
         QMessageBox.information(self, "完成", f"已清理 {count} 个文件")
 
     def closeEvent(self, event):
+        thread = getattr(self, "_apply_thread", None)
+        if thread is not None and thread.isRunning():
+            thread.wait(5000)   # 等后台设置结束，避免退出时线程被销毁
         self.db.close()
         event.accept()
 
@@ -986,12 +1226,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _source_urls(self, name):
-        if name == "unsplash":
-            return [
-                "https://unsplash.com/developers",     # 申请 Key 的控制台
-                "https://unsplash.com/documentation",  # API 文档（可选）
-            ]
-        elif name == "wallhaven":
+        if name == "wallhaven":
             return ["https://wallhaven.cc"]
         return []
 

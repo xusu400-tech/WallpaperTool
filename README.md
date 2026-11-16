@@ -7,16 +7,17 @@
 ## 功能特性
 
 - **多图源搜索**
-  - Bing 每日壁纸（国内直连，默认图源）
+  - 极简壁纸（国内直连，支持中文关键词搜索，免登录 1920x1200，默认图源）
+  - 彼岸图网（国内直连，站点有 WAF 人机验证风险，保留为可选图源）
+  - Bing 每日壁纸（国内直连）
   - Wallhaven 壁纸库
-  - Unsplash 高清摄影
   - 本地文件夹浏览
 - **分类浏览** — 风景、动漫、美女、科幻、游戏、汽车、体育等预设分类
 - **一键设壁纸** — 支持 5 种显示模式：居中、拉伸、适应、填充、平铺
 - **收藏夹** — 收藏喜欢的壁纸，随时回看
 - **历史记录** — SQLite 本地存储，自动记录每次设置的壁纸
 - **缩略图加载** — 异步线程加载网络缩略图，界面不卡顿
-- **代理支持** — 内置 SOCKS5 代理设置，国内访问 Wallhaven / Unsplash 无障碍
+- **代理支持** — 内置 SOCKS5 代理设置，国内访问 Wallhaven 无障碍
 - **缓存管理** — 自动缓存下载的壁纸，支持一键清理
 
 ## 技术栈
@@ -36,7 +37,7 @@
 ```
 WallpaperTool/
 ├── main.py              # 主程序入口，GUI 界面与交互逻辑
-├── api_client.py        # 图源适配器（Bing / Wallhaven / Unsplash / 本地）
+├── api_client.py        # 图源适配器（彼岸图网 / 极简壁纸 / Bing / Wallhaven / 本地）
 ├── wallpaper_engine.py  # 壁纸核心引擎（下载、设置、缩略图、缓存）
 ├── database.py          # SQLite 历史记录与收藏管理
 ├── config.py            # 应用配置（代理设置持久化）
@@ -70,6 +71,7 @@ python main.py
 ```bash
 pip install pyinstaller
 pyinstaller 壁纸助手.spec
+python -m PyInstaller --noconfirm --onefile --windowed --name WallpaperTool --icon image/app_icon.ico --add-data "image;image" main.py
 ```
 
 打包后的程序位于 `dist/` 目录。
@@ -77,7 +79,6 @@ pyinstaller 壁纸助手.spec
 ## 配置说明
 
 - **代理设置** — 在应用内设置页面配置代理地址，格式如 `socks5://127.0.0.1:1080`
-- **Unsplash API Key** — 如需使用 Unsplash 图源，在 `api_client.py` 中填入你的 API Key（[申请地址](https://unsplash.com/developers)）
 - **数据存储位置** — `~/.WallpaperTool/`，包含缓存图片、缩略图、历史数据库和配置文件
 
 ## 开源协议

@@ -1,8 +1,12 @@
 import re
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlencode
 
 import requests
 from pathlib import Path
 from PIL import Image
+
+from wallpaper_engine import netbian_get, NetbianBlockedError, zzzmh_get
 
 # 缺少 config.py 时降级为直连，而不是启动崩溃
 try:
@@ -45,43 +49,6 @@ class WallhavenSource:
         return results, has_more
 
 
-# ================= Unsplash =================
-class UnsplashSource:
-    name = "unsplash"
-    BASE = "https://api.unsplash.com/search/photos"
-
-    def __init__(self, api_key="YOUR_UNSPLASH_KEY"):   # ← 申请后填入
-        self.api_key = api_key
-
-    def search(self, params, page=1, atleast=None, **kw):
-        headers = {"Authorization": f"Client-ID {self.api_key}"}
-        payload = {
-            "query": params.get("q", "nature"),
-            "page": page, "per_page": 30,
-            "orientation": "landscape",
-            "content_filter": "high",
-        }
-        resp = requests.get(self.BASE, headers=headers, params=payload,
-                            timeout=15, proxies=get_proxies())
-        resp.raise_for_status()
-        data = resp.json()
-
-        results = []
-        for item in data.get("results", []):
-            w, h = item["width"], item["height"]
-            results.append({
-                "id": item["id"],
-                "url": f"{item['urls']['raw']}&w={w}&h={h}&fit=crop",
-                "thumb": item["urls"]["small"],
-                "resolution": f"{w}x{h}",
-                "purity": "sfw",
-                "colors": [item.get("color", "")],
-                "author": item["user"]["name"],
-                "source": self.name,
-            })
-        return results, page < data.get("total_pages", 1)
-
-
 # ================= Bing =================
 class BingSource:
     """Bing 每日壁纸，不支持关键词搜索"""
@@ -116,14 +83,15 @@ class NetbianSource:
     """彼岸图网 (netbian.com)，国内直连，按分类浏览（无关键词搜索接口）"""
     name = "netbian"
     BASE = "https://www.netbian.com"
-    HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
     def search(self, params, page=1, atleast=None, **kw):
         slug = params.get("cat") or "fengjing"
         url = f"{self.BASE}/{slug}/" if page <= 1 else f"{self.BASE}/{slug}/index_{page}.htm"
-        resp = requests.get(url, timeout=15, headers=self.HEADERS)
-        resp.raise_for_status()
+        # 统一走 netbian_get：UA/Accept/Referer + 站内 Cookie，遇到 405 会抛明确异常
+        resp = netbian_get(url, timeout=15)
         resp.encoding = "gbk"
+        if "__noxExpire" in resp.text[:2000] or "安全验证" in resp.text[:2000]:
+            raise NetbianBlockedError()
 
         results = []
         for desk, attrs in re.findall(r'<a href="(/desk/\d+\.htm)"[^>]*>\s*<img([^>]+)>', resp.text):
@@ -146,7 +114,101 @@ class NetbianSource:
                 "source": self.name,
             })
         has_more = bool(re.search(rf'/{slug}/index_{page + 1}\.htm', resp.text))
+        if not results:
+            raise RuntimeError(
+                "彼岸图网返回的页面里没有解析到图片列表（可能站点改版或被验证页拦截），\n"
+                "请稍后重试，或切换到「Bing 每日」等其他图源。")
         return results, has_more
+
+
+# ================= 极简壁纸 =================
+class ZzzmhSource:
+    """极简壁纸 (bz.zzzmh.cn)：国内直连、免登录，支持分类浏览与关键词搜索
+
+    列表接口返回卡片缩略图（640x400），原图直链在详情页里；
+    实测免登录可下载的「原图·标准」为 1920x1200（2K/4K/8K 为会员 AI 超分，不可用）。
+    """
+    name = "zzzmh"
+    BASE = "https://bz.zzzmh.cn"
+    PER_PAGE = 24
+
+    def search(self, params, page=1, atleast=None, **kw):
+        offset = (page - 1) * self.PER_PAGE
+        q = (params.get("q") or "").strip()
+        cat = params.get("cat") or ""
+        query = {"offset": offset}
+        if q:                        # 关键词搜索（中文）
+            query.update({"q": q, "from": "search"})
+        elif cat:                    # 分类浏览
+            query.update({"type": cat, "sort": "new"})
+        else:
+            query["sort"] = "new"
+
+        resp = zzzmh_get(f"{self.BASE}/api/cards?" + urlencode(query), timeout=15)
+        data = resp.json()
+        cards = data.get("cards") or ""
+
+        items = []
+        for m in re.finditer(
+                r'<a class="card" href="/wallpaper/([0-9a-f]{32})" data-pid="([0-9a-f]{32})">(.*?)</a>',
+                cards, re.S):
+            pid, block = m.group(1), m.group(3)
+            src = re.search(r'(?:data-)?src="([^"]+)"', block)
+            if not src:
+                continue
+            alt = re.search(r'alt="([^"]*)"', block)
+            items.append({
+                "pid": pid,
+                "thumb": src.group(1),
+                "author": (alt.group(1).strip() if alt else "")[:20] or "极简壁纸",
+            })
+        if not items:
+            raise RuntimeError(
+                "极简壁纸返回的页面里没有解析到图片列表（可能站点改版），\n"
+                "请稍后重试，或切换到其他图源。")
+
+        # 详情页里才有原图直链和真实分辨率，并发获取（实测 24 张约 0.4 秒）
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            details = list(pool.map(self._detail, [it["pid"] for it in items]))
+
+        results = []
+        for it, (url, resolution) in zip(items, details):
+            if not url:
+                continue
+            results.append({
+                "id": f"zzzmh_{it['pid']}",
+                "url": url,
+                "thumb": it["thumb"],
+                "resolution": resolution,
+                "purity": "sfw",
+                "colors": [],
+                "author": it["author"],
+                "source": self.name,
+            })
+        if not results:
+            raise RuntimeError("极简壁纸原图链接解析失败，请稍后重试。")
+        has_more = data.get("next", -1) >= 0
+        return results, has_more
+
+    @staticmethod
+    def _detail(pid):
+        """返回 (原图直链, 实际分辨率)；失败返回 (None, "")"""
+        try:
+            html = zzzmh_get(f"https://bz.zzzmh.cn/wallpaper/{pid}", timeout=10).text
+        except Exception:
+            return None, ""
+        m = re.search(
+            r'<img src="(https://imageai\.zzzmh\.cn/wallpaper/desktop/view/large/'
+            r'[0-9a-f]{32}\.webp)"[^>]*width="(\d+)" height="(\d+)"', html)
+        if m:
+            return m.group(1), f"{m.group(2)}x{m.group(3)}"
+        m = re.search(
+            r'https://imageai\.zzzmh\.cn/wallpaper/desktop/view/large/[0-9a-f]{32}\.webp',
+            html)
+        if not m:
+            return None, ""
+        tier = re.search(r'data-tier="(\d+)\s*[×x]\s*(\d+)"', html)
+        return m.group(0), (f"{tier.group(1)}x{tier.group(2)}" if tier else "1920x1200")
 
 
 # ================= 本地文件夹 =================
@@ -191,9 +253,9 @@ class LocalSource:
 # ================= 源注册表 =================
 SOURCE_REGISTRY = {
     "wallhaven": WallhavenSource(),
-    "unsplash":  UnsplashSource(),
     "bing":      BingSource(),
     "netbian":   NetbianSource(),
+    "zzzmh":     ZzzmhSource(),
     "local":     LocalSource(),
 }
 

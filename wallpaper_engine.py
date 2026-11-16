@@ -2,6 +2,9 @@
 壁纸核心引擎：获取分辨率 / 下载图片 / 设置壁纸
 """
 import os
+import io
+import time
+import hashlib
 import ctypes
 import ctypes.wintypes as wt
 import requests
@@ -30,6 +33,114 @@ def get_screen_resolution():
 
 
 # ============ 图片下载 ============
+_APP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+# 彼岸图网统一请求头：搜索页、列表页、原图、缩略图都复用这一套。
+# 站点前置了百度 WAF，缺 UA/Referer 的裸请求会被判为异常流量（HTTP 405）
+NETBIAN_HEADERS = {
+    "User-Agent": _APP_UA,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Referer": "https://www.netbian.com/",
+    "Connection": "keep-alive",
+}
+
+NETBIAN_BLOCKED_MSG = (
+    "彼岸图网当前对本机网络触发了百度 WAF 人机验证（HTTP 405）。\n"
+    "这属于站点侧的访问限制，补 UA/Referer 也无法绕过。\n\n"
+    "可以尝试：\n"
+    "1. 等待 1~5 分钟后重新搜索（WAF 拦截通常会自动解除）；\n"
+    "2. 在浏览器打开 https://www.netbian.com 手动完成滑块验证；\n"
+    "3. 临时切换到「Bing 每日」等其他图源。"
+)
+
+
+class NetbianBlockedError(RuntimeError):
+    """彼岸图网触发 WAF 人机验证（HTTP 405）"""
+
+    def __init__(self, msg=NETBIAN_BLOCKED_MSG):
+        super().__init__(msg)
+
+
+# img.netbian.com 有防盗链：不带站内 Cookie 时部分图片返回 405
+_NETBIAN_SESSION = None
+
+
+def get_netbian_session(refresh=False):
+    """获取（或重建）彼岸图网会话；访问站内首页获取防盗链 Cookie"""
+    global _NETBIAN_SESSION
+    if refresh:
+        _NETBIAN_SESSION = None
+    if _NETBIAN_SESSION is None:
+        s = requests.Session()
+        s.headers.update(NETBIAN_HEADERS)
+        try:
+            s.get("https://www.netbian.com/", timeout=10,
+                  proxies=_get_proxies_safe())
+        except Exception:
+            pass
+        _NETBIAN_SESSION = s
+    return _NETBIAN_SESSION
+
+
+def netbian_get(url: str, timeout: int = 15, stream: bool = False):
+    """彼岸图网所有请求的统一入口：统一请求头 + 405/WAF 识别
+
+    405 时先重建会话重试一次（Cookie 过期场景）；仍 405 则抛出
+    NetbianBlockedError，交给界面显示明确提示而不是原始 HTTP 报错。
+    """
+    resp = get_netbian_session().get(
+        url, timeout=timeout, stream=stream, proxies=_get_proxies_safe())
+    if resp.status_code == 405:
+        time.sleep(1)
+        resp = get_netbian_session(refresh=True).get(
+            url, timeout=timeout, stream=stream, proxies=_get_proxies_safe())
+        if resp.status_code == 405:
+            raise NetbianBlockedError()
+    resp.raise_for_status()
+    return resp
+
+
+# 极简壁纸（bz.zzzmh.cn / imageai.zzzmh.cn）统一请求头：
+# 站点与图床都校验 Referer，裸请求会被拒绝
+ZZZMH_HEADERS = {
+    "User-Agent": _APP_UA,
+    "Accept": "text/html,application/json;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Referer": "https://bz.zzzmh.cn/",
+}
+
+
+def zzzmh_get(url: str, timeout: int = 15, stream: bool = False):
+    """极简壁纸所有请求的统一入口（列表、详情、原图、缩略图都走这里）"""
+    resp = requests.get(url, headers=ZZZMH_HEADERS, timeout=timeout,
+                        stream=stream, proxies=_get_proxies_safe())
+    resp.raise_for_status()
+    return resp
+
+
+def fetch_image_bytes(url: str, timeout: int = 10) -> bytes:
+    """下载图片原始字节（缩略图等场景），失败时抛出异常由调用方处理"""
+    if "netbian.com" in url:
+        return netbian_get(url, timeout=timeout).content
+    if "zzzmh.cn" in url:
+        return zzzmh_get(url, timeout=timeout).content
+    resp = requests.get(url, timeout=timeout, proxies=_get_proxies_safe(),
+                        headers={"User-Agent": _APP_UA})
+    resp.raise_for_status()
+    return resp.content
+
+
+def _get_proxies_safe():
+    try:
+        from config import get_proxies   # 延迟导入，避免循环依赖
+    except ImportError:                  # 缺少 config.py 时降级为直连
+        return None
+    return get_proxies()
+
+
 def download_image(url: str, filename: str = None) -> Path:
     """
     下载图片到本地缓存目录，返回文件路径
@@ -40,24 +151,29 @@ def download_image(url: str, filename: str = None) -> Path:
             filename += ".jpg"
 
     save_path = CACHE_DIR / filename
-    try:
-        from config import get_proxies   # 延迟导入，避免循环依赖
-    except ImportError:                  # 缺少 config.py 时降级为直连
-        def get_proxies():
-            return None
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, stream=True, timeout=30,
-                                proxies=get_proxies(), headers=headers)
-            resp.raise_for_status()
-            break
-        except requests.exceptions.SSLError:
-            if attempt == 2:
-                raise
-        except requests.exceptions.RequestException:
-            if attempt == 2:
-                raise
+    if "netbian.com" in url:
+        # 统一走会话请求头；WAF 拦截直接抛明确异常，不做无意义的 3 次重试
+        resp = netbian_get(url, timeout=30, stream=True)
+    elif "zzzmh.cn" in url:
+        resp = zzzmh_get(url, timeout=30, stream=True)
+    else:
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    url, stream=True, timeout=30,
+                    proxies=_get_proxies_safe(),
+                    headers={"User-Agent": _APP_UA})
+                resp.raise_for_status()
+                break
+            except requests.exceptions.SSLError:
+                if attempt == 2:
+                    raise
+                time.sleep(1 + attempt)
+            except requests.exceptions.RequestException:
+                if attempt == 2:
+                    raise
+                time.sleep(1 + attempt)
 
     with open(save_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
@@ -138,6 +254,30 @@ from PIL import Image
 # 缩略图目录
 THUMB_DIR = Path.home() / ".WallpaperTool" / "thumbs"
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
+
+# 网络缩略图缓存目录（按 URL 哈希命名，保存缩小后的 JPEG，避免反复下载原尺寸图片）
+THUMB_CACHE_DIR = Path.home() / ".WallpaperTool" / "thumb_cache"
+THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+THUMB_SIZE = (400, 280)   # 缓存缩略图最大尺寸（卡片显示尺寸的 2 倍左右）
+
+
+def thumbnail_cache_path(key: str) -> Path:
+    """缩略图缓存文件路径（同一 URL 始终映射同一文件）"""
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return THUMB_CACHE_DIR / f"{digest}.jpg"
+
+
+def save_thumbnail_bytes(data: bytes, dest: Path, size=THUMB_SIZE) -> bool:
+    """把网络图片缩小后写入缓存；失败返回 False（不影响当次显示）"""
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img = img.convert("RGB")
+            img.thumbnail(size, Image.LANCZOS)
+            img.save(dest, "JPEG", quality=82)
+        return True
+    except Exception:
+        return False
 
 
 def generate_thumbnail(image_path: str, size=(320, 220)):
