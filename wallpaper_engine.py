@@ -127,10 +127,29 @@ def fetch_image_bytes(url: str, timeout: int = 10) -> bytes:
         return netbian_get(url, timeout=timeout).content
     if "zzzmh.cn" in url:
         return zzzmh_get(url, timeout=timeout).content
-    resp = requests.get(url, timeout=timeout, proxies=_get_proxies_safe(),
-                        headers={"User-Agent": _APP_UA})
-    resp.raise_for_status()
-    return resp.content
+    # th.wallhaven.cc（图床）国内可直连，wallhaven.cc（API）被墙需代理：
+    # 缩略图优先直连，失败再走代理，两种网络环境下都能加载
+    if "th.wallhaven.cc" in url:
+        for proxies in (None, _get_proxies_safe()):
+            try:
+                resp = requests.get(url, timeout=timeout, proxies=proxies,
+                                    headers={"User-Agent": _APP_UA})
+                resp.raise_for_status()
+                return resp.content
+            except requests.exceptions.RequestException:
+                continue
+        raise RuntimeError(f"缩略图下载失败: {url}")
+    last_err = None
+    for attempt in range(3):   # SSL 握手偶发被重置，加退避重试
+        try:
+            resp = requests.get(url, timeout=timeout, proxies=_get_proxies_safe(),
+                                headers={"User-Agent": _APP_UA})
+            resp.raise_for_status()
+            return resp.content
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            time.sleep(0.8 * (attempt + 1))
+    raise last_err
 
 
 def _get_proxies_safe():
@@ -322,3 +341,248 @@ def scan_local_folder(folder: str):
             "source": "local",
         })
     return results
+
+
+# ============ 动态壁纸（视频） ============
+VIDEO_CACHE_DIR = Path.home() / ".WallpaperTool" / "videos"
+VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+LIVELY_HELP = (
+    "Windows 系统本身不支持视频桌面壁纸，需要借助免费开源的 Lively Wallpaper 播放。\n\n"
+    "1. 下载安装 Lively Wallpaper（免费）：\n"
+    "   官网  https://rocksdanister.github.io/lively\n"
+    "   或 Microsoft Store 搜索 \"Lively Wallpaper\"\n"
+    "2. 安装后重新点击「设置动态壁纸」，本工具会自动调用它。\n"
+    "3. 若安装的是非默认路径，可在菜单【设置 → Lively 路径设置...】里\n"
+    "   手动指定 livelywallpaper.exe 的位置。"
+)
+
+
+class LivelyNotFoundError(RuntimeError):
+    """未找到 Lively Wallpaper（动态壁纸播放器）"""
+
+    def __init__(self, msg=LIVELY_HELP):
+        super().__init__(msg)
+
+
+def download_video(url: str, filename: str = None) -> Path:
+    """下载视频 mp4 到本地缓存目录（videos），返回文件路径；已存在直接复用"""
+    if not filename:
+        filename = url.split("/")[-1].split("?")[0]
+        if not filename.lower().endswith(".mp4"):
+            filename += ".mp4"
+    save_path = VIDEO_CACHE_DIR / filename
+    if save_path.exists() and save_path.stat().st_size > 0:
+        return save_path
+    resp = requests.get(url, stream=True, timeout=60,
+                        proxies=_get_proxies_safe(),
+                        headers={"User-Agent": _APP_UA})
+    resp.raise_for_status()
+    tmp = save_path.with_suffix(".part")
+    with open(tmp, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1 << 16):
+            f.write(chunk)
+    tmp.replace(save_path)
+    return save_path
+
+
+def find_lively_install():
+    """定位 Lively Wallpaper，返回 (exe路径, 是否商店版, 包FamilyName, 应用AppId)，找不到返回 None
+
+    覆盖两种安装方式：
+    - 普通安装版：livelywallpaper.exe（注册表 / 常见目录）
+    - 微软商店 MSIX 版：Build\\Lively.exe（Get-AppxPackage 查询，
+      包目录受系统保护，必须通过 Invoke-CommandInDesktopPackage 启动）
+    """
+    import winreg
+
+    # 1. 用户手动指定的路径（菜单【设置 → Lively 路径设置...】）
+    try:
+        from config import get_lively_path
+        p = get_lively_path()
+        if p and Path(p).exists():
+            return Path(p), False, "", ""
+    except ImportError:
+        pass
+
+    # 入口 exe 名称随版本不同：1.x/安装版 livelywallpaper.exe，2.x 用户目录安装版 Lively.exe
+    candidates = ["livelywallpaper.exe", "livelywallpaper",
+                  "Lively Wallpaper.exe", "Lively.exe", "lively.exe"]
+    found = []
+
+    def check_registry(root, key_path):
+        try:
+            with winreg.OpenKey(root, key_path) as k:
+                val = winreg.QueryValueEx(k, "")[0]
+        except OSError:
+            return
+        # 命令形如 "C:\...\livelywallpaper.exe" "%1" ，提取引号里的 exe 路径
+        val = val.strip().strip('"')
+        exe = val.split('"')[0].strip() if '"' in val else val
+        if exe.lower().endswith(".exe") and Path(exe).exists():
+            found.append(Path(exe))
+
+    # 2. lively:// URI 协议注册的命令 + 3. App Paths（普通安装版）
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        check_registry(root, r"Software\Classes\lively\shell\open\command")
+        for name in candidates:
+            check_registry(
+                root,
+                rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{name}")
+    if found:
+        return found[0], False, "", ""
+
+    # 4. 常见安装位置（普通安装版）
+    import os
+    program_files = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("LOCALAPPDATA", "") + r"\Programs"]
+    for base in program_files:
+        for sub in ("Lively Wallpaper", "LivelyWallpaper", "lively"):
+            for name in candidates:
+                exe = Path(base) / sub / name
+                if exe.exists():
+                    return exe, False, "", ""    # 5. 微软商店（MSIX）版：Get-AppxPackage 查询安装位置，
+    #    再从 AppxManifest.xml 里读入口 exe 和应用 Id
+    try:
+        import subprocess, json
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-AppxPackage *lively* | "
+             "Select-Object PackageFamilyName,InstallLocation | ConvertTo-Json"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        pkg = json.loads(r.stdout) if r.stdout.strip() else None
+        # 只装了一个包时 ConvertTo-Json 输出单个对象而非数组
+        if isinstance(pkg, list):
+            pkg = pkg[0] if pkg else None
+        if pkg and pkg.get("InstallLocation"):
+            location = Path(pkg["InstallLocation"])
+            manifest = location / "AppxManifest.xml"
+            if manifest.exists():
+                import re
+                xml = manifest.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(
+                    r'<Application[^>]*Id="([^"]+)"[^>]*Executable="([^"]+)"',
+                    xml)
+                if m:
+                    app_id, exe_rel = m.group(1), m.group(2).replace("/", "\\")
+                    exe = location / exe_rel
+                    if exe.exists():
+                        return exe, True, pkg.get("PackageFamilyName", ""), app_id
+    except Exception:
+        pass
+
+    # 6. 微软商店应用别名（老版本可能注册了别名）
+    windows_apps = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps"
+    for name in candidates:
+        exe = windows_apps / name
+        if exe.exists():
+            return exe, False, "", ""
+    return None
+
+
+def find_lively_exe():
+    """兼容旧接口：只返回主程序路径，找不到返回 None"""
+    info = find_lively_install()
+    return info[0] if info else None
+
+
+def _lively_cli_args(exe: Path, video_path: str):
+    """按 Lively 版本生成命令行参数
+
+    - 2.x（入口 Lively.exe）：动词式命令 setwp --file <媒体文件路径>
+    - 1.x（入口 livelywallpaper.exe）：旧式参数 --wallpaper-url <file URI>
+    """
+    if exe.name.lower() == "lively.exe":
+        return ["setwp", "--file", video_path]
+    return ["--wallpaper-url", Path(video_path).as_uri()]
+
+
+def _lively_rejected_args(before: float, log_marker):
+    """启动后检查 Lively 日志，判断参数是否被拒绝（UnknownOptionError 等）
+
+    只检查启动之后新写入的内容：log_marker 是启动前记录的 (最新日志路径, 文件大小)，
+    避免旧日志里的错误误判。
+    """
+    import time as _time
+    deadline = _time.time() + 6
+    log_dir = Path.home() / "AppData" / "Local" / "Lively Wallpaper" / "logs"
+    old_path, old_size = log_marker
+    while _time.time() < deadline:
+        try:
+            files = sorted(log_dir.glob("*.txt"), key=lambda f: f.stat().st_mtime)
+            for f in files:
+                if f == old_path:
+                    # 只读启动后追加的部分
+                    if f.stat().st_size <= old_size:
+                        continue
+                    with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+                        fh.seek(old_size)
+                        new_text = fh.read()
+                elif f.stat().st_mtime >= before:
+                    new_text = f.read_text(encoding="utf-8", errors="ignore")
+                else:
+                    continue
+                if "UnknownOptionError" in new_text or \
+                        "|ERROR|Lively.Commandline" in new_text:
+                    return True
+        except OSError:
+            pass
+        _time.sleep(0.5)
+    return False
+
+
+def _lively_latest_log():
+    """返回当前最新 Lively 日志的 (路径, 大小)，不存在返回 (None, 0)"""
+    log_dir = Path.home() / "AppData" / "Local" / "Lively Wallpaper" / "logs"
+    try:
+        files = sorted(log_dir.glob("*.txt"), key=lambda f: f.stat().st_mtime)
+        if files:
+            latest = files[-1]
+            return latest, latest.stat().st_size
+    except OSError:
+        pass
+    return None, 0
+
+
+def set_video_wallpaper(video_path: str):
+    """用 Lively Wallpaper 设置动态壁纸
+
+    - 普通安装版：直接启动 exe 传参
+    - 商店（MSIX）版：包目录受系统保护无法直接启动，
+      通过 Invoke-CommandInDesktopPackage 在包上下文里带参启动
+    启动后会轮询 Lively 日志几秒，若参数被拒绝则报错而不是假成功。
+    """
+    import time
+    import subprocess
+    video_path = os.path.abspath(video_path)
+    if not Path(video_path).exists():
+        raise FileNotFoundError(f"视频文件不存在: {video_path}")
+    info = find_lively_install()
+    if not info:
+        raise LivelyNotFoundError()
+    exe, is_msix, family, app_id = info
+    args = _lively_cli_args(exe, video_path)
+    before = time.time()
+    log_marker = _lively_latest_log()
+    if is_msix:
+        # PowerShell 的 -Args 按空格切分并处理引号，路径加引号防切分
+        cmd = (
+            f'Invoke-CommandInDesktopPackage '
+            f'-PackageFamilyName "{family}" '
+            f'-AppId "{app_id}" '
+            f'-Command "{exe}" '
+            f'-Args \'' + " ".join(f'"{a}"' for a in args) + "'")
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            cwd=str(exe.parent),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    else:
+        subprocess.Popen([str(exe)] + args,
+                         cwd=str(exe.parent),
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if _lively_rejected_args(before, log_marker):
+        raise RuntimeError(
+            "Lively 拒绝了设置命令（命令行参数与已安装版本不兼容）。\n"
+            "请在 Lively 主界面手动导入视频：\n" + video_path)
+    return True

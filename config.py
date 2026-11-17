@@ -37,3 +37,27 @@ def get_proxies():
     if not url:
         return None
     return {"http": url, "https": url}
+
+
+def get_pixabay_key():
+    """Pixabay API key（动态壁纸视频图源），未设置返回空字符串"""
+    return str(_load().get("pixabay_key", "") or "").strip()
+
+
+def set_pixabay_key(key):
+    """保存 Pixabay API key；传空字符串表示清除"""
+    cfg = _load()
+    cfg["pixabay_key"] = str(key or "").strip()
+    _save(cfg)
+
+
+def get_lively_path():
+    """Lively Wallpaper 主程序路径（动态壁纸播放器），未设置返回空字符串"""
+    return str(_load().get("lively_path", "") or "").strip()
+
+
+def set_lively_path(path):
+    """保存 Lively Wallpaper 主程序路径"""
+    cfg = _load()
+    cfg["lively_path"] = str(path or "").strip()
+    _save(cfg)

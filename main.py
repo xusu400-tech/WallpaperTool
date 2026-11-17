@@ -25,10 +25,20 @@ from PyQt5.QtGui import QPixmap, QIcon, QImage, QImageReader
 from wallpaper_engine import (
     get_screen_resolution, download_image, set_wallpaper,
     delete_cached_image, clear_cache, generate_thumbnail, fetch_image_bytes,
-    THUMB_CACHE_DIR, thumbnail_cache_path, save_thumbnail_bytes
+    THUMB_CACHE_DIR, thumbnail_cache_path, save_thumbnail_bytes,
+    download_video, set_video_wallpaper, LivelyNotFoundError
 )
 from database import HistoryDB, THUMB_DIR
 from api_client import SOURCE_REGISTRY, get_source
+
+# 视频播放组件（预览用）；缺失时预览降级为调用系统默认播放器
+try:
+    from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+    from PyQt5.QtMultimediaWidgets import QVideoWidget
+    from PyQt5.QtCore import QUrl
+    MULTIMEDIA_AVAILABLE = True
+except ImportError:
+    MULTIMEDIA_AVAILABLE = False
 
 # PyInstaller 打包后资源在 sys._MEIPASS 解包目录，源码运行时在脚本目录
 if getattr(sys, "frozen", False):
@@ -53,8 +63,8 @@ except ImportError:
 # ============ 每个图源对应的分类配置 ============
 CATEGORY_MAP = {
     "wallhaven": [
-        {"key": "featured",  "label": "精选",  "params": {"sorting": "toplist", "topRange": "1M"}},
         {"key": "landscape", "label": "风景",  "params": {"q": "landscape"}},
+        {"key": "featured",  "label": "精选",  "params": {"sorting": "toplist", "topRange": "1M"}},
         {"key": "anime",     "label": "动漫",  "params": {"categories": "010"}},
         {"key": "beauty",    "label": "美女",  "params": {"q": "women", "categories": "001"}},
         {"key": "scifi",     "label": "科幻",  "params": {"q": "sci-fi"}},
@@ -84,8 +94,8 @@ CATEGORY_MAP = {
         {"key": "rili",     "label": "日历", "params": {"cat": "rili"}},
     ],
     "zzzmh": [
-        {"key": "人物", "label": "人物", "params": {"cat": "人物"}},
         {"key": "风景", "label": "风景", "params": {"cat": "风景"}},
+        {"key": "人物", "label": "人物", "params": {"cat": "人物"}},
         {"key": "动物", "label": "动物", "params": {"cat": "动物"}},
         {"key": "食物", "label": "食物", "params": {"cat": "食物"}},
         {"key": "华丽", "label": "华丽", "params": {"cat": "华丽"}},
@@ -95,6 +105,19 @@ CATEGORY_MAP = {
         {"key": "景观", "label": "景观", "params": {"cat": "景观"}},
     ],
     "local": [],   # 本地源无分类
+    "video_pexels": [   # 动态壁纸：Pexels 精选（免 key）
+        {"key": "curated", "label": "精选", "params": {}},
+    ],
+    "video_pixabay": [  # 动态壁纸：Pixabay 视频（需免费 key）
+        {"key": "nature",  "label": "自然",  "params": {"q": "nature"}},
+        {"key": "ocean",   "label": "海洋",  "params": {"q": "ocean"}},
+        {"key": "city",    "label": "城市",  "params": {"q": "city"}},
+        {"key": "space",   "label": "太空",  "params": {"q": "space"}},
+        {"key": "animal",  "label": "动物",  "params": {"q": "animals"}},
+        {"key": "flower",  "label": "花卉",  "params": {"q": "flowers"}},
+        {"key": "abstract","label": "抽象",  "params": {"q": "abstract"}},
+        {"key": "night",   "label": "夜景",  "params": {"q": "night city"}},
+    ],
 }
 
 # 极简壁纸国内直连、免登录且支持关键词搜索，作为默认图源（下拉框第一项 = 默认选中）
@@ -104,7 +127,11 @@ SOURCE_LABELS = {
     "bing":      "Bing 每日",
     "wallhaven": "Wallhaven",
     "local":     "本地文件夹",
+    "video_pexels":  "动态壁纸·精选（免Key）",
+    "video_pixabay": "动态壁纸·Pixabay（需Key）",
 }
+
+VIDEO_SOURCES = ("video_pexels", "video_pixabay")
 
 # 这些图源国内无法直连：切换过去时不自动加载，先给出代理提示 + 开关
 PROXY_REQUIRED_SOURCES = {"wallhaven"}
@@ -253,15 +280,96 @@ class ApplyThread(QThread):
             self.failed.emit(str(e))
 
 
+class VideoApplyThread(QThread):
+    """后台下载视频并调用 Lively Wallpaper 设置动态壁纸
+
+    顺带下载封面图生成缩略图，历史记录里能显示视频封面。
+    """
+    done = pyqtSignal(str, str)      # 视频路径, 封面缩略图路径
+    failed = pyqtSignal(str)
+
+    def __init__(self, info):
+        super().__init__()
+        self.info = info
+
+    def run(self):
+        try:
+            url = self.info["url"]
+            if url.startswith("http"):
+                path = download_video(url)
+            else:
+                path = Path(url)
+            set_video_wallpaper(str(path))
+
+            # 用封面图生成缩略图（mp4 本身无法用 PIL 生成）
+            thumb = ""
+            thumb_url = self.info.get("thumb", "")
+            if thumb_url.startswith("http"):
+                try:
+                    data = fetch_image_bytes(thumb_url, timeout=10)
+                    dest = THUMB_DIR / f"{path.stem}_thumb.jpg"
+                    if save_thumbnail_bytes(data, dest):
+                        thumb = str(dest)
+                except Exception:
+                    pass
+            self.done.emit(str(path), thumb)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class DownloadPlayThread(QThread):
+    """下载视频（走缓存）后用系统默认播放器打开——预览内嵌播放失败时的兜底"""
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, info):
+        super().__init__()
+        self.info = info
+
+    def run(self):
+        try:
+            url = self.info["url"]
+            path = download_video(url) if url.startswith("http") else Path(url)
+            self.done.emit(str(path))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class VideoSaveThread(QThread):
+    """把视频另存到用户选择的文件夹（下载走缓存 + 复制，避免重复下载）"""
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, info, dest):
+        super().__init__()
+        self.info = info
+        self.dest = Path(dest)
+
+    def run(self):
+        try:
+            url = self.info["url"]
+            path = download_video(url) if url.startswith("http") else Path(url)
+            if path.resolve() != self.dest.resolve():
+                import shutil
+                shutil.copyfile(path, self.dest)
+            self.done.emit(str(self.dest))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 # ================= 壁纸卡片（搜索结果） =================
 class WallpaperCard(QFrame):
     def __init__(self, wallpaper_info, parent=None):
         super().__init__(parent)
         self.info = wallpaper_info
         self.is_fav = False
+        self.is_video = wallpaper_info.get("kind") == "video"
         self.setFrameStyle(QFrame.Box | QFrame.Plain)
         self.setLineWidth(1)
         self.setFixedSize(200, 220)
+        self.setObjectName("wallCard")
+        self.setToolTip("双击或点 👁 播放预览" if self.is_video
+                        else "双击或点 👁 预览大图")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -269,7 +377,9 @@ class WallpaperCard(QFrame):
         self.thumb_label = QLabel()
         self.thumb_label.setFixedSize(190, 130)
         self.thumb_label.setAlignment(Qt.AlignCenter)
-        self.thumb_label.setStyleSheet("background:#eee;")
+        self.thumb_label.setStyleSheet("background:rgba(255,255,255,0.75); border-radius:6px;")
+        if self.is_video:
+            self.thumb_label.setText("🎬 加载封面…")
         layout.addWidget(self.thumb_label)
 
         info_label = QLabel(f"ⓘ {self.info['resolution']} · {self.info.get('author', '')}")
@@ -277,18 +387,47 @@ class WallpaperCard(QFrame):
         layout.addWidget(info_label)
 
         btn_row = QHBoxLayout()
-        self.btn_apply = QPushButton("设置")
+        btn_row.setSpacing(6)
+        self.btn_apply = QPushButton("设动态" if self.is_video else "设置")
+        self.btn_apply.setStyleSheet(
+            "QPushButton{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 #5b8cff, stop:1 #4a6cf7); border:none; border-radius:6px;"
+            "color:white; font-size:12px; padding:4px 0;}"
+            "QPushButton:hover{background:#3f5fe8;}")
         self.btn_apply.clicked.connect(self.on_apply)
+        self.btn_preview = QPushButton("👁")
+        self.btn_preview.setFixedSize(30, 28)
+        self.btn_preview.setStyleSheet(
+            "QPushButton{background:white; border:1px solid #dfe6f2;"
+            "border-radius:6px; font-size:13px; padding:0;}"
+            "QPushButton:hover{border-color:#4a6cf7;}")
+        self.btn_preview.clicked.connect(self.open_preview)
         self.btn_fav = QPushButton("🤍")
-        self.btn_fav.setFixedWidth(36)
-        self.btn_fav.setStyleSheet("border:none; background:transparent; font-size:18px;")
+        self.btn_fav.setFixedSize(30, 28)
+        self.btn_fav.setStyleSheet(
+            "QPushButton{background:white; border:1px solid #dfe6f2;"
+            "border-radius:6px; font-size:13px; padding:0;}"
+            "QPushButton:hover{border-color:#4a6cf7;}")
+        if self.is_video:
+            self.btn_fav.setText("💾")
+            self.btn_fav.setToolTip("保存 MP4 到本地")
         self.btn_fav.clicked.connect(self.on_toggle_fav)
-        btn_row.addWidget(self.btn_apply, 2)
-        btn_row.addWidget(self.btn_fav, 1)
+        btn_row.addWidget(self.btn_apply, 1)
+        btn_row.addWidget(self.btn_preview)
+        btn_row.addWidget(self.btn_fav)
         layout.addLayout(btn_row)
 
         self.load_thumb()
         # self._check_fav_state()
+
+    def mouseDoubleClickEvent(self, event):
+        self.open_preview()
+
+    def open_preview(self):
+        if self.is_video:
+            VideoPreviewDialog(self.window(), self.info).exec()
+        else:
+            PreviewDialog(self.window(), self.info).exec()
 
     def load_thumb(self):
         url = self.info.get("thumb") or self.info.get("url", "")
@@ -313,7 +452,7 @@ class WallpaperCard(QFrame):
         self.set_pixmap(QPixmap.fromImage(image))
 
     def _on_thumb_failed(self):
-        self.thumb_label.setText("图片加载失败")
+        self.thumb_label.setText("🎬 封面加载失败" if self.is_video else "图片加载失败")
         self.thumb_label.setStyleSheet(
             "background:#eee; color:#999; font-size:12px;")
 
@@ -337,6 +476,9 @@ class WallpaperCard(QFrame):
     def on_toggle_fav(self):
         main = self.window()
         info = self.info
+        if self.is_video:
+            self.save_video()
+            return
         if self.is_fav:
             main.db.remove_favorite(info["url"])
             self._set_fav(False)
@@ -377,6 +519,33 @@ class WallpaperCard(QFrame):
         self._set_fav(False)
         QMessageBox.warning(self, "收藏失败", msg)
 
+    def save_video(self):
+        """视频卡片 💾：把 mp4 另存到用户选择的文件夹"""
+        if getattr(self, "_save_thread", None) is not None and self._save_thread.isRunning():
+            return
+        url = self.info["url"]
+        default_name = url.split("/")[-1].split("?")[0] or "wallpaper.mp4"
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "保存视频", default_name, "MP4 视频 (*.mp4)")
+        if not dest:
+            return
+        self.btn_fav.setEnabled(False)
+        self.btn_fav.setText("…")
+        self._save_thread = VideoSaveThread(self.info, dest)
+        self._save_thread.done.connect(self._on_save_done)
+        self._save_thread.failed.connect(self._on_save_failed)
+        self._save_thread.start()
+
+    def _on_save_done(self, dest):
+        self.btn_fav.setEnabled(True)
+        self.btn_fav.setText("💾")
+        QMessageBox.information(self, "已保存", f"视频已保存到：\n{dest}")
+
+    def _on_save_failed(self, msg):
+        self.btn_fav.setEnabled(True)
+        self.btn_fav.setText("💾")
+        QMessageBox.warning(self, "保存失败", msg)
+
     def on_apply(self):
         main = self.window()
         main.apply_wallpaper(self.info)
@@ -416,11 +585,20 @@ class HistoryCard(QFrame):
     def _build_btn_row(self, layout):
         """历史卡片按钮行：应用 + 删除（无收藏爱心）"""
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
         btn_apply = QPushButton("应用")
+        btn_apply.setStyleSheet(
+            "QPushButton{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 #5b8cff, stop:1 #4a6cf7); border:none; border-radius:6px;"
+            "color:white; font-size:12px; padding:4px 0;}"
+            "QPushButton:hover{background:#3f5fe8;}")
         btn_apply.clicked.connect(self.on_apply)
         btn_del = QPushButton("🗑")
-        btn_del.setFixedWidth(30)
-        btn_del.setStyleSheet("border:none; background:transparent; font-size:14px;")
+        btn_del.setFixedSize(30, 28)
+        btn_del.setStyleSheet(
+            "QPushButton{background:white; border:1px solid #dfe6f2;"
+            "border-radius:6px; font-size:12px; padding:0;}"
+            "QPushButton:hover{border-color:#e05555;}")
         btn_del.clicked.connect(self.on_delete)
         btn_row.addWidget(btn_apply, 1)
         btn_row.addWidget(btn_del)
@@ -511,11 +689,20 @@ class FavoriteCard(HistoryCard):
     def _build_btn_row(self, layout):
         """收藏卡片按钮行：应用 + ❤️ 取消收藏（无删除垃圾桶）"""
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
         btn_apply = QPushButton("应用")
+        btn_apply.setStyleSheet(
+            "QPushButton{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 #5b8cff, stop:1 #4a6cf7); border:none; border-radius:6px;"
+            "color:white; font-size:12px; padding:4px 0;}"
+            "QPushButton:hover{background:#3f5fe8;}")
         btn_apply.clicked.connect(self.on_apply)
         self.btn_fav = QPushButton("❤️")
-        self.btn_fav.setFixedWidth(30)
-        self.btn_fav.setStyleSheet("border:none; background:transparent; font-size:16px;")
+        self.btn_fav.setFixedSize(30, 28)
+        self.btn_fav.setStyleSheet(
+            "QPushButton{background:white; border:1px solid #dfe6f2;"
+            "border-radius:6px; font-size:12px; padding:0;}"
+            "QPushButton:hover{border-color:#e05555;}")
         self.btn_fav.setToolTip("点击取消喜欢")
         self.btn_fav.clicked.connect(self.on_fav)
         btn_row.addWidget(btn_apply, 1)
@@ -529,6 +716,315 @@ class FavoriteCard(HistoryCard):
         main.refresh_favorites()
         main._sync_fav_icons()
 
+
+
+# ================= 大图预览 =================
+class FullImageLoader(QThread):
+    """加载原图全尺寸（复用 fetch_image_bytes 的各图源下载逻辑）"""
+
+    loaded = pyqtSignal(QImage)
+    failed = pyqtSignal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            if self.url.startswith("http"):
+                data = fetch_image_bytes(self.url, timeout=30)
+                image = QImage.fromData(data)
+            else:   # 本地源：全尺寸解码
+                reader = QImageReader(self.url)
+                reader.setAutoTransform(True)
+                image = reader.read()
+            if image.isNull():
+                self.failed.emit("图片解码失败")
+            else:
+                self.loaded.emit(image)
+        except Exception as e:
+            self.failed.emit(str(e)[:120])
+
+
+class PreviewDialog(QDialog):
+    """大图预览：双击卡片或点 👁 打开，加载原图并可直接设为壁纸"""
+
+    def __init__(self, parent, info):
+        super().__init__(parent)
+        self.info = info
+        self._thread = None
+        self.setWindowTitle("预览")
+        self.setMinimumSize(780, 580)
+        self.resize(900, 660)
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+
+        self.image_label = QLabel("⏳ 正在加载原图…")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setMinimumSize(750, 440)
+        self.image_label.setWordWrap(True)
+        lay.addWidget(self.image_label, 1)
+
+        bottom = QHBoxLayout()
+        src_label = SOURCE_LABELS.get(info.get("source", ""), info.get("source", ""))
+        meta = f"ⓘ {info.get('resolution', '')} · {src_label}"
+        if info.get("author"):
+            meta += f" · {info['author']}"
+        bottom.addWidget(QLabel(meta))
+        bottom.addStretch()
+        self.btn_apply = QPushButton("🖼 设为壁纸")
+        self.btn_apply.setObjectName("accentBtn")
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.clicked.connect(self._apply)
+        bottom.addWidget(self.btn_apply)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.close)
+        bottom.addWidget(btn_close)
+        lay.addLayout(bottom)
+
+        self._load(info.get("url", ""))
+
+    def _load(self, url):
+        if not url:
+            self.image_label.setText("无可用图片")
+            return
+        self._thread = FullImageLoader(url)
+        self._thread.loaded.connect(self._show)
+        self._thread.failed.connect(self._show_failed)
+        self._thread.start()
+
+    def _show(self, image):
+        self._full_image = image
+        self.btn_apply.setEnabled(True)
+        self.image_label.setPixmap(QPixmap.fromImage(image).scaled(
+            self.image_label.size(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _show_failed(self, msg):
+        self.image_label.setText(f"原图加载失败：{msg}")
+
+    def _apply(self):
+        main = self.window()
+        main.apply_wallpaper(self.info)
+        self.accept()   # 设置成功后关闭预览
+
+    def resizeEvent(self, event):
+        # 窗口拉伸时按当前显示的图片重新适配
+        pix = self.image_label.pixmap()
+        if pix and not pix.isNull():
+            data = getattr(self, "_full_image", None)
+            if data is not None:
+                self.image_label.setPixmap(QPixmap.fromImage(data).scaled(
+                    self.image_label.size(),
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        super().resizeEvent(event)
+
+
+# ================= 视频预览（动态壁纸） =================
+class VideoPreviewDialog(QDialog):
+    """视频预览：内嵌播放器边看边决定；也可直接设为动态壁纸"""
+
+    def __init__(self, parent, info):
+        super().__init__(parent)
+        self.info = info
+        self._main = parent   # 对话框自己是顶层窗口，不能用 self.window() 找主窗
+        self._player = None
+        self._play_thread = None
+        self.setWindowTitle("动态壁纸预览")
+        self.setMinimumSize(780, 560)
+        self.resize(900, 640)
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+
+        self.player_label = None
+        self._video_widget = None
+        if MULTIMEDIA_AVAILABLE:
+            self._video_widget = QVideoWidget()
+            self._video_widget.setStyleSheet("background:#111; border-radius:8px;")
+            lay.addWidget(self._video_widget, 1)
+        else:
+            self.player_label = QLabel(
+                "本机缺少 Qt 多媒体组件，无法内嵌播放。\n"
+                "可直接点「设为动态壁纸」，或关闭后点卡片 💾 保存 MP4 用本地播放器观看。")
+            self.player_label.setAlignment(Qt.AlignCenter)
+            self.player_label.setWordWrap(True)
+            self.player_label.setMinimumSize(750, 420)
+            lay.addWidget(self.player_label, 1)
+
+        bottom = QHBoxLayout()
+        src_label = SOURCE_LABELS.get(info.get("source", ""), info.get("source", ""))
+        meta = f"ⓘ {info.get('resolution', '')} · {src_label} · {info.get('author', '')}"
+        bottom.addWidget(QLabel(meta))
+        bottom.addStretch()
+        self.btn_apply = QPushButton("🎬 设为动态壁纸")
+        self.btn_apply.setObjectName("accentBtn")
+        self.btn_apply.clicked.connect(self._apply)
+        bottom.addWidget(self.btn_apply)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.close)
+        bottom.addWidget(btn_close)
+        lay.addLayout(bottom)
+
+        if MULTIMEDIA_AVAILABLE:
+            self._start_player()
+
+    def _start_player(self):
+        url = self.info.get("url", "")
+        if not url:
+            self._video_widget.hide()
+            self.player_label = QLabel("无可用视频链接")
+            self.player_label.setAlignment(Qt.AlignCenter)
+            self.layout().insertWidget(0, self.player_label, 1)
+            return
+        self._player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
+        self._player.setMedia(QMediaContent(QUrl(url)))
+        self._player.setVideoOutput(self._video_widget)
+        self._player.error.connect(self._player_error)
+        self._player.play()
+
+    def _player_error(self, error):
+        """内嵌播放失败（常见于缺 h264 解码器 0x80040218）：提供系统播放器兜底"""
+        if self._video_widget is not None:
+            self._video_widget.hide()
+        fallback = QVBoxLayout()
+        self.player_label = QLabel(
+            "内嵌播放失败（系统缺少视频解码器）。\n"
+            "不影响设置动态壁纸，可直接点下方「设为动态壁纸」；"
+            "也可以先用系统播放器看看效果：")
+        self.player_label.setAlignment(Qt.AlignCenter)
+        self.player_label.setWordWrap(True)
+        self.btn_open_sys = QPushButton("▶ 用系统播放器打开")
+        self.btn_open_sys.setObjectName("accentBtn")
+        self.btn_open_sys.clicked.connect(self._open_with_system_player)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(self.btn_open_sys)
+        row.addStretch()
+        fallback.addWidget(self.player_label, 1)
+        fallback.addLayout(row)
+        wrap = QWidget()
+        wrap.setLayout(fallback)
+        self.layout().insertWidget(0, wrap)
+
+    def _open_with_system_player(self):
+        if self._play_thread is not None and self._play_thread.isRunning():
+            return
+        self.btn_open_sys.setEnabled(False)
+        self.btn_open_sys.setText("⏳ 正在下载…")
+        self._play_thread = DownloadPlayThread(self.info)
+        self._play_thread.done.connect(self._on_play_thread_done)
+        self._play_thread.failed.connect(self._on_play_thread_failed)
+        self._play_thread.start()
+
+    def _on_play_thread_done(self, path):
+        self.btn_open_sys.setEnabled(True)
+        self.btn_open_sys.setText("▶ 用系统播放器打开")
+        try:
+            os.startfile(path)   # 调用系统默认播放器
+        except OSError as e:
+            QMessageBox.warning(self, "打开失败", f"无法调用系统播放器：\n{e}")
+
+    def _on_play_thread_failed(self, msg):
+        self.btn_open_sys.setEnabled(True)
+        self.btn_open_sys.setText("▶ 用系统播放器打开")
+        QMessageBox.warning(self, "下载失败", msg)
+
+    def _apply(self):
+        self._main.apply_wallpaper(self.info)
+        self.close()
+
+    def closeEvent(self, event):
+        if self._player is not None:
+            self._player.stop()
+        event.accept()
+
+
+# ================= 全局主题样式 =================
+GLOBAL_QSS = """
+/* 背景容器全部透明，露出背景图 */
+QTabWidget::pane { border: none; background: transparent; }
+QTabBar { background: transparent; }
+QTabBar::tab {
+    background: rgba(255,255,255,0.55); color: #556;
+    padding: 10px 24px; margin-right: 4px;
+    border-radius: 8px; font-size: 13px; min-width: 72px;
+}
+QTabBar::tab:selected { background: white; color: #4a6cf7; font-weight: bold; }
+QScrollArea { border: none; background: transparent; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+QMenuBar { background: transparent; }
+QMenu { background: white; border: 1px solid #e3e8f0; border-radius: 8px; padding: 6px; }
+QMenu::item { padding: 6px 24px; border-radius: 6px; }
+QMenu::item:selected { background: #4a6cf7; color: white; }
+
+/* 输入控件 */
+QLineEdit, QComboBox {
+    background: rgba(255,255,255,0.85); border: 1px solid #dfe6f2;
+    border-radius: 8px; padding: 6px 10px; font-size: 13px; color: #333;
+}
+QLineEdit:focus, QComboBox:focus { border-color: #4a6cf7; }
+QComboBox::drop-down { border: none; width: 24px; }
+QComboBox QAbstractItemView {
+    background: white; border: 1px solid #e3e8f0;
+    selection-background-color: #4a6cf7; selection-color: white;
+}
+
+/* 按钮 */
+QPushButton {
+    background: rgba(255,255,255,0.9); border: 1px solid #dfe6f2;
+    border-radius: 8px; padding: 6px 16px; font-size: 13px; color: #333;
+}
+QPushButton:hover { border-color: #4a6cf7; color: #4a6cf7; }
+QPushButton:pressed { background: #eef2ff; }
+QPushButton#accentBtn {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #5b8cff, stop:1 #4a6cf7);
+    border: none; color: white; font-weight: bold; padding: 8px 22px;
+}
+QPushButton#accentBtn:hover { background: #3f5fe8; }
+QPushButton#accentBtn:pressed { background: #3550cf; }
+QPushButton#accentBtn:disabled { background: #b8c6e8; }
+
+/* 壁纸卡片 */
+QFrame#wallCard {
+    background: rgba(255,255,255,0.82);
+    border: 1px solid rgba(227,232,240,0.9);
+    border-radius: 10px;
+}
+QFrame#wallCard:hover {
+    background: white; border-color: #7ea0ff;
+}
+
+/* 滚动条 */
+QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
+QScrollBar::handle:vertical { background: rgba(120,135,180,0.5); border-radius: 4px; min-height: 40px; }
+QScrollBar::handle:vertical:hover { background: rgba(90,110,180,0.8); }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: transparent; height: 8px; margin: 0; }
+QScrollBar::handle:horizontal { background: rgba(120,135,180,0.5); border-radius: 4px; min-width: 40px; }
+QScrollBar::handle:horizontal:hover { background: rgba(90,110,180,0.8); }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+/* 进度条 */
+QProgressBar {
+    background: rgba(255,255,255,0.7); border: 1px solid #dfe6f2;
+    border-radius: 6px; height: 12px; text-align: center; color: #667;
+}
+QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+    stop:0 #5b8cff, stop:1 #4a6cf7); border-radius: 5px; }
+
+/* 预览对话框 */
+QLabel#previewImage { background: transparent; }
+QLabel { background: transparent; font-size: 13px; }
+"""
 
 
 # ================= 主窗口 =================
@@ -562,14 +1058,23 @@ class MainWindow(QMainWindow):
         self.setGeometry(100, 100, 1100, 700)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.setStyleSheet(GLOBAL_QSS)
         central = QWidget()
+        central.setObjectName("centralWidget")
         self.setCentralWidget(central)
+        # 背景图：border-image 自动拉伸铺满窗口，无需处理 resize
+        bg_path = APP_DIR / "image" / "app_bg.jpg"
+        if bg_path.exists():
+            central.setStyleSheet(
+                f"QWidget#centralWidget{{ border-image: url({bg_path.as_posix()}) 0; }}")
         main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(10, 6, 10, 8)
 
         self._build_menu()
 
         info_bar = QLabel(f"🖥 本机分辨率: {self.resolution[0]} × {self.resolution[1]}")
-        info_bar.setStyleSheet("font-size: 14px; color: #666; padding: 4px;")
+        info_bar.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #3d4a6b; padding: 6px 2px;")
         main_layout.addWidget(info_bar)
 
         self.tabs = QTabWidget()
@@ -618,7 +1123,7 @@ class MainWindow(QMainWindow):
         self.scroll.setWidget(self.grid_container)
         search_layout.addWidget(self.scroll, 1)
 
-        self.tabs.addTab(search_tab, "🔍 搜索壁纸")
+        self.tabs.addTab(search_tab, "搜索壁纸")
 
         # -- Tab 2: 我的喜欢 --
         fav_tab = QWidget()
@@ -637,7 +1142,7 @@ class MainWindow(QMainWindow):
         self.fav_grid.setSpacing(10)
         scroll_fav.setWidget(self.fav_grid_container)
         fav_layout.addWidget(scroll_fav)
-        self.tabs.addTab(fav_tab, "❤️ 我的喜欢")
+        self.tabs.addTab(fav_tab, "我的喜欢")
 
         # -- Tab 3: 历史 --
         history_tab = QWidget()
@@ -659,7 +1164,7 @@ class MainWindow(QMainWindow):
         self.hist_grid.setSpacing(10)
         scroll_hist.setWidget(self.hist_grid_container)
         h_layout.addWidget(scroll_hist)
-        self.tabs.addTab(history_tab, "📜 历史记录")
+        self.tabs.addTab(history_tab, "历史记录")
 
         self.refresh_history()
         self.refresh_favorites()
@@ -675,10 +1180,56 @@ class MainWindow(QMainWindow):
             proxy_action = QAction("代理设置...", self)
             proxy_action.triggered.connect(self.show_proxy_settings)
             settings_menu.addAction(proxy_action)
+            pixabay_action = QAction("Pixabay Key 设置...", self)
+            pixabay_action.triggered.connect(self.show_pixabay_key_settings)
+            settings_menu.addAction(pixabay_action)
+            lively_action = QAction("Lively 路径设置...", self)
+            lively_action.triggered.connect(self.show_lively_path_settings)
+            settings_menu.addAction(lively_action)
         help_menu = menu_bar.addMenu("帮助")
         about_action = QAction("关于", self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
+
+    def show_pixabay_key_settings(self):
+        """动态壁纸 Pixabay 视频图源的免费 API Key 配置入口"""
+        try:
+            from config import get_pixabay_key, set_pixabay_key
+        except ImportError:
+            return
+        current = get_pixabay_key()
+        tip = ("Pixabay 视频（动态壁纸图源）需要免费 API Key：\n"
+               "1. 注册/登录 https://pixabay.com\n"
+               "2. 访问 https://pixabay.com/api/docs/ 查看 \"Your API key\"\n"
+               "3. 把 Key 粘贴到这里\n"
+               "不使用该图源可不填写（「动态壁纸·精选」免 Key 可用）。\n\n"
+               f"当前 Key: {current[:6] + '...' if current else '未设置'}")
+        key, ok = QInputDialog.getText(self, "Pixabay Key 设置", tip, text=current)
+        if not ok:
+            return
+        set_pixabay_key(key)
+        QMessageBox.information(
+            self, "完成",
+            "Pixabay Key 已保存。\n切换到「动态壁纸·Pixabay」图源即可搜索视频。")
+
+    def show_lively_path_settings(self):
+        """手动指定 Lively Wallpaper 主程序路径（自动定位失败时使用）"""
+        try:
+            from config import get_lively_path, set_lively_path
+        except ImportError:
+            return
+        current = get_lively_path()
+        tip = ("设置动态壁纸需要 Lively Wallpaper（免费开源）。\n"
+               "一般情况下无需手动指定（自动定位），仅当安装到了非默认位置时填写。\n"
+               "例如: C:\\Program Files\\Lively Wallpaper\\livelywallpaper.exe\n\n"
+               f"当前: {current or '未设置（自动定位）'}")
+        path, ok = QFileDialog.getOpenFileName(
+            self, "选择 Lively Wallpaper 主程序", current or "",
+            "可执行文件 (*.exe)")
+        if not ok or not path:
+            return
+        set_lively_path(path)
+        QMessageBox.information(self, "完成", f"Lively 路径已保存:\n{path}")
 
     def show_proxy_settings(self):
         current = get_proxy_url()
@@ -709,6 +1260,8 @@ class MainWindow(QMainWindow):
             <li><b>Bing</b>：图片来自微软 Bing 每日壁纸，版权归微软及原作者所有</li>
             <li><b>彼岸图网</b>：图片来自 netbian.com，仅供个人欣赏，请勿商用</li>
             <li><b>极简壁纸</b>：图片来自 bz.zzzmh.cn，仅供个人欣赏，请勿商用</li>
+            <li><b>动态壁纸·精选</b>：视频来自 Pexels（免费授权），仅供个人桌面欣赏，请勿商用</li>
+            <li><b>动态壁纸·Pixabay</b>：视频来自 pixabay.com（免费授权），仅供个人桌面欣赏，请勿商用</li>
             <li><b>本地</b>：图片来自您本机文件夹，版权归原始作者所有</li>
             </ul>
             <p>请尊重原作者版权，勿将图片用于商业用途。</p>
@@ -835,13 +1388,17 @@ class MainWindow(QMainWindow):
     def _sync_source_controls(self, name):
         """根据当前图源同步控件状态（启动时和切换图源时都会调用）"""
         self.btn_pick_folder.setVisible(name == "local")
-        searchable = name in ("wallhaven", "zzzmh")
+        searchable = name in ("wallhaven", "zzzmh", "video_pixabay")
         self.search_input.setEnabled(searchable)
         self.btn_search.setEnabled(searchable)
         if name == "wallhaven":
             self.search_input.setPlaceholderText("输入英文关键词，如 landscape / game ...")
         elif name == "zzzmh":
             self.search_input.setPlaceholderText("输入中文关键词搜索，如 风景 / 猫 / 星空 ...")
+        elif name == "video_pixabay":
+            self.search_input.setPlaceholderText("输入英文关键词搜索视频，如 ocean / city ...")
+        elif name == "video_pexels":
+            self.search_input.setPlaceholderText("精选视频免 Key 直接浏览，选择上方分类即可")
         elif name == "bing":
             self.search_input.setPlaceholderText("Bing 每日一图自动更新，无需搜索")
         elif name == "netbian":
@@ -1094,20 +1651,35 @@ class MainWindow(QMainWindow):
 
     # ---------- 壁纸操作 ----------
     def apply_wallpaper(self, info):
-        """点击「设置」：下载与系统调用交给后台线程，界面保持可响应"""
+        """点击「设置」：下载与系统调用交给后台线程，界面保持可响应
+
+        视频卡片（kind=video 或 .mp4 链接）走 VideoApplyThread：
+        下载 mp4 后调用 Lively Wallpaper 设置动态壁纸。
+        """
         thread = getattr(self, "_apply_thread", None)
         if thread is not None and thread.isRunning():
             return   # 上一次还在执行，忽略重复点击
         self._apply_info = info
-        self._apply_style = self.style_combo.currentText().split(" ")[0]
+        is_video = (info.get("kind") == "video"
+                    or str(info.get("url", "")).lower().endswith(".mp4"))
+        if is_video:
+            self._apply_style = "video"
+        else:
+            self._apply_style = self.style_combo.currentText().split(" ")[0]
         # 搜索结果没有 tags 字段，沿用搜索框内容；历史/收藏卡片带回原标签
         self._apply_tags = info.get("tags", self.search_input.text())
 
-        self.statusBar().showMessage(f"正在下载并设置壁纸（{info['resolution']}）...")
+        msg = "正在下载并设置动态壁纸（{}）...".format(info['resolution']) \
+            if is_video else \
+            "正在下载并设置壁纸（{}）...".format(info['resolution'])
+        self.statusBar().showMessage(msg)
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
 
-        self._apply_thread = ApplyThread(info, self._apply_style)
+        if is_video:
+            self._apply_thread = VideoApplyThread(info)
+        else:
+            self._apply_thread = ApplyThread(info, self._apply_style)
         self._apply_thread.done.connect(self.on_apply_done)
         self._apply_thread.failed.connect(self.on_apply_failed)
         self._apply_thread.start()
@@ -1137,6 +1709,22 @@ class MainWindow(QMainWindow):
         self.statusBar().clearMessage()
         if not self.is_loading:
             self.progress.setVisible(False)
+        if "Lively Wallpaper" in msg:
+            # 未安装 Lively：给出安装指引（带可点击链接），而不是原始报错
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("需要安装 Lively Wallpaper")
+            box.setText(
+                "设置动态壁纸前，需要先安装免费开源的 Lively Wallpaper。\n\n"
+                "下载安装后，回到本工具重新点「设动态」即可，无需其它配置。<br>"
+                "• 官网下载：<a href='https://rocksdanister.github.io/lively'>"
+                "rocksdanister.github.io/lively</a><br>"
+                "• 或在 Microsoft Store 搜索 \"Lively Wallpaper\"<br><br>"
+                "安装位置非默认时，可在菜单【设置 → Lively 路径设置...】手动指定。")
+            box.setTextFormat(Qt.RichText)
+            box.setStandardButtons(QMessageBox.Ok)
+            box.exec_()
+            return
         QMessageBox.critical(self, "设置失败", msg)
 
     # ---------- 收藏 / 历史 ----------

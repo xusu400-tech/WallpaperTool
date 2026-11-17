@@ -250,6 +250,142 @@ class LocalSource:
         return results, has_more
 
 
+# ================= 动态壁纸：Pexels 精选视频 =================
+# Pexels CDN 直链可匿名下载（无需 key），以下是逐条实测可用的高清视频，
+# 作为动态壁纸的免 key 兜底图源（如某条失效，设置时下载会报错，换一条即可）
+PEXELS_CURATED = [
+    ("3571264", "海岸航拍",
+     "https://videos.pexels.com/video-files/3571264/3571264-hd_1920_1080_30fps.mp4"),
+    ("2098989", "自然风光",
+     "https://videos.pexels.com/video-files/2098989/2098989-hd_1920_1080_30fps.mp4"),
+    ("1093662", "海浪",
+     "https://videos.pexels.com/video-files/1093662/1093662-hd_1920_1080_30fps.mp4"),
+    ("1409899", "山水风光",
+     "https://videos.pexels.com/video-files/1409899/1409899-hd_1920_1080_25fps.mp4"),
+    ("3129957", "云海延时",
+     "https://videos.pexels.com/video-files/3129957/3129957-hd_1920_1080_25fps.mp4"),
+    ("855564",  "星空",
+     "https://videos.pexels.com/video-files/855564/855564-hd_1920_1080_24fps.mp4"),
+    ("1918465", "城市夜景",
+     "https://videos.pexels.com/video-files/1918465/1918465-hd_1920_1080_24fps.mp4"),
+    ("3163534", "自然风光",
+     "https://videos.pexels.com/video-files/3163534/3163534-hd_1920_1080_30fps.mp4"),
+    ("1526909", "森林瀑布",
+     "https://videos.pexels.com/video-files/1526909/1526909-hd_1920_1080_24fps.mp4"),
+    ("2792370", "自然风光",
+     "https://videos.pexels.com/video-files/2792370/2792370-hd_1920_1080_30fps.mp4"),
+]
+
+
+class PexelsCuratedSource:
+    """动态壁纸精选：内置的 Pexels 高清视频直链（免 key、国内直连）"""
+    name = "video_pexels"
+    PER_PAGE = 10
+
+    def search(self, params, page=1, atleast=None, **kw):
+        q = (params.get("q") or "").strip().lower()
+        items = [v for v in PEXELS_CURATED
+                 if not q or q in v[1].lower() or q in v[0]]
+        per_page = self.PER_PAGE
+        start = (page - 1) * per_page
+        batch = items[start:start + per_page]
+        has_more = start + per_page < len(items)
+
+        results = []
+        for vid, title, url in batch:
+            results.append({
+                "id": f"pxvid_{vid}",
+                "url": url,
+                "thumb": ("https://images.pexels.com/videos/" + vid +
+                          "/free-video-" + vid + ".jpg?auto=compress&cs=tinysrgb&w=400"),
+                "resolution": "1920x1080",
+                "purity": "sfw",
+                "colors": [],
+                "author": f"Pexels · {title}",
+                "source": self.name,
+                "kind": "video",
+            })
+        return results, has_more
+
+
+# ================= 动态壁纸：Pixabay 视频 =================
+PIXABAY_KEY_HELP = (
+    "Pixabay 视频图源需要免费的 API Key：\n\n"
+    "1. 打开 https://pixabay.com/accounts/register/ 注册（免费）\n"
+    "2. 登录后访问 https://pixabay.com/api/docs/ ，\n"
+    "   页面上「Your API key」处就是你的 Key\n"
+    "3. 复制 Key，在菜单【设置 → Pixabay Key 设置...】里粘贴保存\n\n"
+    "没有 Key 时也可以使用「动态壁纸·精选」图源（免 Key）。"
+)
+
+
+class PixabayVideoSource:
+    """Pixabay 视频 API（https://pixabay.com/api/videos/），需要免费 API key
+
+    Key 保存在 ~/.WallpaperTool/config.json 的 pixabay_key 字段，
+    通过菜单【设置 → Pixabay Key 设置...】配置。
+    """
+    name = "video_pixabay"
+    BASE = "https://pixabay.com/api/videos/"
+    PER_PAGE = 24
+
+    def search(self, params, page=1, atleast=None, **kw):
+        try:
+            from config import get_pixabay_key
+        except ImportError:
+            get_pixabay_key = lambda: ""
+        key = get_pixabay_key()
+        if not key:
+            raise RuntimeError(PIXABAY_KEY_HELP)
+
+        payload = {"key": key, "safesearch": "true",
+                   "per_page": self.PER_PAGE, "page": page}
+        q = (params.get("q") or "").strip()
+        if q:
+            payload["q"] = q
+        resp = requests.get(self.BASE, params=payload, timeout=15,
+                            proxies=get_proxies())
+        if resp.status_code == 400:
+            raise RuntimeError(
+                "Pixabay API Key 无效（400 Invalid API key）。\n\n"
+                + PIXABAY_KEY_HELP)
+        resp.raise_for_status()
+        data = resp.json()
+
+        results = []
+        for item in data.get("hits", []):
+            vids = item.get("videos", {})
+            pick = None
+            for tag in ("large", "medium", "small"):   # 优先 1080p
+                v = vids.get(tag)
+                if v and str(v.get("url", "")).lower().endswith(".mp4"):
+                    pick = v
+                    break
+            if not pick:
+                continue
+            picture_id = item.get("picture_id", "")
+            thumb = (f"https://i.vimeocdn.com/video/{picture_id}_640x360.jpg"
+                     if picture_id else "")
+            duration = item.get("duration", 0)
+            results.append({
+                "id": f"pxvid_{item['id']}",
+                "url": pick["url"],
+                "thumb": thumb,
+                "resolution": f"{pick.get('width', '')}x{pick.get('height', '')}",
+                "purity": "sfw",
+                "colors": [],
+                "author": (f"{item.get('user', 'Pixabay')}"
+                           + (f" · {duration}s" if duration else "")),
+                "source": self.name,
+                "kind": "video",
+            })
+        if not results:
+            raise RuntimeError(
+                "Pixabay 视频没有返回结果（可能关键词无匹配或 Key 配额用尽）。")
+        has_more = page * self.PER_PAGE < int(data.get("totalHits", 0))
+        return results, has_more
+
+
 # ================= 源注册表 =================
 SOURCE_REGISTRY = {
     "wallhaven": WallhavenSource(),
@@ -257,6 +393,8 @@ SOURCE_REGISTRY = {
     "netbian":   NetbianSource(),
     "zzzmh":     ZzzmhSource(),
     "local":     LocalSource(),
+    "video_pexels":  PexelsCuratedSource(),
+    "video_pixabay": PixabayVideoSource(),
 }
 
 
